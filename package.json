@@ -1,0 +1,67 @@
+{
+  "name": "dsh-connect-opencode-free",
+  "version": "0.2.0",
+  "description": "OpenCode Zen 免费模型 —— 为 DSH 注入免 key 的 OpenCode Zen 免费档模型：设置页一键同步官方 free 模型、逐个启停、手动补模型，并可一键写入 llm-pi-ai provider 配置。",
+  "type": "module",
+  "main": "./lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./client": "./lib/client.cjs",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "scripts",
+    "src",
+    "cordis.patch.yml",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "test": "node --test test/*.test.js",
+    "verify": "node scripts/build.mjs --check"
+  },
+  "keywords": [
+    "deepseek-harness",
+    "dsh-plugin",
+    "dsh-bundle",
+    "opencode",
+    "free-models",
+    "model-provider"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/yu-wenchao/dsh-connect-opencode-free.git"
+  },
+  "homepage": "https://github.com/yu-wenchao/dsh-connect-opencode-free#readme",
+  "bugs": {
+    "url": "https://github.com/yu-wenchao/dsh-connect-opencode-free/issues"
+  },
+  "author": "yu-wenchao",
+  "license": "MIT",
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "@deepseek-ai/schemastery": "*"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-settings"
+      ]
+    }
+  },
+  "peerDependencies": {
+    "@deepseek-ai/dsh-llm": ">=0.1.7-rc.1 <0.3.0-0",
+    "@deepseek-ai/schemastery": "*"
+  },
+  "devDependencies": {
+    "@deepseek-ai/dsh-llm": "*"
+  }
+}
