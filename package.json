@@ -32,13 +32,13 @@
   ],
   "repository": {
     "type": "git",
-    "url": "https://github.com/yu-wenchao/dsh-connect-opencode-free.git"
+    "url": "git+https://github.com/DragonHorizon-xtihc/dsh-connect-opencode-free.git"
   },
-  "homepage": "https://github.com/yu-wenchao/dsh-connect-opencode-free#readme",
+  "homepage": "https://github.com/DragonHorizon-xtihc/dsh-connect-opencode-free#readme",
   "bugs": {
-    "url": "https://github.com/yu-wenchao/dsh-connect-opencode-free/issues"
+    "url": "https://github.com/DragonHorizon-xtihc/dsh-connect-opencode-free/issues"
   },
-  "author": "yu-wenchao",
+  "author": "DragonHorizon-xtihc",
   "license": "MIT",
   "engines": {
     "node": ">=18"

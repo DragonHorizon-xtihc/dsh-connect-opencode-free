@@ -39,7 +39,7 @@
    ```
 3. 在同文件 `dependencies` 中登记依赖。开发态用 `link:` 指向本仓库源码：
    ```json
-   "dsh-connect-opencode-free": "link:D:/ClaudeCode/deepseek-harness/plugins/dsh-connect-opencode-free"
+   "dsh-connect-opencode-free": "link:D:/ClaudeCode/github/dsh-opencode/dsh-connect-opencode-free"
    ```
    若要安装发布版，则写版本范围，例如 `"^0.2.0"`。
 4. 在该 profile 目录执行安装（会重新解析软链并应用 `cordis.patch.yml`）：
