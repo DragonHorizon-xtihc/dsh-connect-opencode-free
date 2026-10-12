@@ -32,16 +32,15 @@
 
 本插件是一个 DSH **cordis 插件包（bundle）**，通过 profile 的 `package.json` 接入；在开发态用源码软链即可运行，无需先发布。
 
-1. 进入目标 profile 目录（例如 `E:/UserAgentData/.dsh/profiles/web`）。
+1. 进入目标 profile 目录（例如 `~/.dsh/profiles/<profile-name>`）。
 2. 在 `package.json` 的 `dsh.profile.bundles` 数组里加入包名：
    ```json
    "dsh-connect-opencode-free"
    ```
-3. 在同文件 `dependencies` 中登记依赖。开发态用 `link:` 指向本仓库源码：
+3. 在同文件 `dependencies` 中登记依赖。发布版直接写版本范围，例如 `"^0.2.0"`；开发态若要从源码运行，用 `link:` 指向本仓库的绝对路径：
    ```json
-   "dsh-connect-opencode-free": "link:D:/ClaudeCode/github/dsh-opencode/dsh-connect-opencode-free"
+   "dsh-connect-opencode-free": "link:/absolute/path/to/dsh-connect-opencode-free"
    ```
-   若要安装发布版，则写版本范围，例如 `"^0.2.0"`。
 4. 在该 profile 目录执行安装（会重新解析软链并应用 `cordis.patch.yml`）：
    ```sh
    pnpm install
