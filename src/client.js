@@ -27,6 +27,7 @@ import {
   PROVIDERS_NS,
   QUOTA_POLICIES,
   ZEN_ROUTE_ID,
+  apiKeyNameFor,
   buildProviderEntry,
   buildModelSet,
   clampInt,
@@ -98,7 +99,12 @@ const zh = {
   autoSync: '自动同步',
   autoSyncHint: '宿主按下面的间隔重新发现模型；关闭后冻结，直到手动同步。',
   interval: '发现间隔（分钟）',
-  includeDeprecated: '显示已弃用的免费模型',
+  includeDeprecated: '显示已下架的免费模型',
+  includeDeprecatedHint: '默认不显示任何已下架的模型：models.dev 标记弃用的，以及 Zen 已下架的。勾选后两者都会列出，但 Zen 已下架的仍标记为不可用，勾了也无法调用。',
+  retry: '失败重试',
+  retryAttempts: '最多尝试几次',
+  retryBackoff: '初始退避（毫秒）',
+  retryHint: '遇到 429 限流或 5xx（含 Zen 网关 502 上游连接超时）时自动退避重试。默认 10 次；退避逐次翻倍、单次最长 8 秒，十次合计约 1 分钟。全部失败后错误信息会写明已重试几次。',
   quotaPolicy: '使用规则',
   policyPublicOnly: '仅使用公共额度',
   policyPublicOnlyHint: '默认规则。任何情况下都不动用 Key，即使配置了也不用。',
@@ -112,10 +118,12 @@ const zh = {
   keyVerified: 'Key 校验通过（{time}）',
   keyRejected: 'Key 校验未通过：{reason}',
   keyUnchecked: '尚未校验 Key',
-  apiKeyEnv: '私有额度 Key（环境变量名）',
-  apiKeyHint: '填环境变量名（多个用逗号分隔并轮换）。每个名字先查凭据库、再查环境变量。它是备用额度：只有公共免费额度用尽或被拒时才动用。',
-  zenKey: '去 https://opencode.ai/zen 领取 Key',
-  zenKeyHint: '领到 Key 后：把它写进上面填的环境变量名（例如 OPENCODE_API_KEY），或在宿主的凭据库里以同名保存。不配也能用——公共免费额度是默认通道。',
+  keyPending: '已填写 Key，正在同步到宿主…',
+  apiKeys: '私有额度 Key',
+  apiKeysHint: '逐条粘贴 Key 即可，不需要配置环境变量。保存后插件会自动按行号写入进程环境变量（见每行左侧名字），重启后依然有效。',
+  keyAdd: '添加 Key',
+  keyRemove: '删除这条 Key',
+  zenKey: '在 opencode.ai/zen 领取 Key',
   zenBaseURL: 'Zen 接口地址',
   catalogURL: '模型目录地址',
 }
@@ -173,7 +181,12 @@ const en = {
   autoSync: 'Auto sync',
   autoSyncHint: 'The Host re-discovers models on the interval below; off freezes the list until you sync by hand.',
   interval: 'Discovery interval (minutes)',
-  includeDeprecated: 'Show deprecated free models',
+  includeDeprecated: 'Show withdrawn free models',
+  includeDeprecatedHint: 'Off by default: neither the models models.dev has retired nor the ones Zen has taken down are listed. Turning it on lists both, but one Zen withdrew stays marked unavailable and cannot be called.',
+  retry: 'Failure retries',
+  retryAttempts: 'Attempts',
+  retryBackoff: 'Initial backoff (ms)',
+  retryHint: 'Retried with backoff on 429 throttling and any 5xx (including Zen gateway 502 upstream connect timeouts). Default 10; the step doubles each time and is capped at 8s, so ten attempts wait about a minute in total. The final error states how many were spent.',
   quotaPolicy: 'Usage rule',
   policyPublicOnly: 'Public quota only',
   policyPublicOnlyHint: 'The default. Never spends a key, even when one is configured.',
@@ -187,10 +200,12 @@ const en = {
   keyVerified: 'Key verified ({time})',
   keyRejected: 'Key check failed: {reason}',
   keyUnchecked: 'Key not verified yet',
-  apiKeyEnv: 'Private-quota key (environment variable name)',
-  apiKeyHint: 'An environment variable name (comma-separated for several, used round-robin). Each name is read from the credential store first, then the environment. It is a fallback: spent only once the public quota is exhausted or refused.',
-  zenKey: 'Get a key at https://opencode.ai/zen',
-  zenKeyHint: 'Once you have one, put it in the environment variable named above (e.g. OPENCODE_API_KEY), or save it in the Host credential store under the same name. No key is required — the public free quota is the default lane.',
+  keyPending: 'Key entered; syncing to the Host…',
+  apiKeys: 'Private-quota keys',
+  apiKeysHint: 'Paste each key on its own row — no environment variables to configure. The plugin exports them under the names shown at the left of each row, and they survive a restart.',
+  keyAdd: 'Add key',
+  keyRemove: 'Remove this key',
+  zenKey: 'Get a key at opencode.ai/zen',
   zenBaseURL: 'Zen endpoint',
   catalogURL: 'Model catalog endpoint',
 }
@@ -343,6 +358,22 @@ function OpenCodeFreeSettings(props) {
   // the next catalog read overwrites it with the same fact.
   const [keyCheck, setKeyCheck] = useState(null)
   const [verifying, setVerifying] = useState(false)
+  // The keys being edited. Held locally so typing does not write the profile on
+  // every keystroke; the whole list is committed on each change instead, which
+  // is also what makes the Host re-export it immediately.
+  const [keyDraft, setKeyDraft] = useState(null)
+
+  // Checkbox ticks shown ahead of the Host, keyed by field. A write is a
+  // round trip through the Host and back, and a tick that only appears when it
+  // lands reads as an unresponsive control — so the press is echoed at once and
+  // the entry is dropped the moment the snapshot agrees (or disagrees: a
+  // refused write then snaps back, which is the honest outcome).
+  const [optimistic, setOptimistic] = useState({})
+  const tickOf = (field, committed) => {
+    const pending = optimistic[field]
+    return pending === undefined ? committed === true : pending === true
+  }
+
 
   const [, forceRender] = useState(0)
   useEffect(() => scope.subscribe(() => { forceRender((n) => n + 1) }), [scope])
@@ -369,6 +400,27 @@ function OpenCodeFreeSettings(props) {
     if (form === undefined) return Promise.resolve(false)
     return form.set(field, next)
   }, [scope])
+
+  /**
+   * Write one boolean field and echo the press immediately.
+   *
+   * The echo is cleared when the snapshot catches up, and replaced with the
+   * committed value when the write failed, so the control always converges on
+   * what is actually stored.
+   * @param field - config field inside this plugin's namespace.
+   * @param next - the value being turned on.
+   */
+  const toggleBoolean = useCallback(async (field, next) => {
+    setOptimistic((prev) => ({ ...prev, [field]: next }))
+    const accepted = await set(field, next)
+    setOptimistic((prev) => {
+      if (!(field in prev)) return prev
+      const rest = { ...prev }
+      delete rest[field]
+      if (accepted !== true) rest[field] = next === true
+      return rest
+    })
+  }, [set])
 
   /**
    * Pull the Host's catalog; `syncToken` is what makes the Host re-read its
@@ -418,6 +470,32 @@ function OpenCodeFreeSettings(props) {
     }
   }, [bridgePort, load])
 
+  /**
+   * The keys as edited, falling back to what the Host holds.
+   *
+   * `keyDraft` is null until the operator touches a row, so the page shows the
+   * persisted list rather than an empty one on first paint.
+   */
+  const keyValues = keyDraft !== null
+    ? keyDraft
+    : (Array.isArray(value.apiKeys) ? value.apiKeys.map((v) => String(v ?? '')) : [])
+
+  /**
+   * Commit the whole key list.
+   *
+   * One write per edit, not per keystroke, so the profile is not rewritten
+   * constantly — and the Host re-exports the variables on the write it does
+   * get, which is what makes a newly typed key immediately verifiable.
+   * @param next - the new list.
+   */
+  const commitKeys = useCallback(async (next) => {
+    setKeyDraft(next)
+    return set('apiKeys', next)
+  }, [set])
+  const replaceKey = (index, next) => commitKeys(keyValues.map((v, i) => (i === index ? next : v)))
+  const removeKey = (index) => commitKeys(keyValues.filter((_, i) => i !== index))
+  const addKey = () => commitKeys([...keyValues, ''])
+
   // Read on mount, then keep reading: the Host rediscovers on its own schedule
   // and the page must show that without the operator pressing anything. A
   // timer also means a read that fails while the page is still mounting — the
@@ -455,15 +533,38 @@ function OpenCodeFreeSettings(props) {
     return rows.filter((row) => `${row.id} ${row.name}`.toLowerCase().includes(needle))
   }, [rows, query])
 
-  const toggle = useCallback((id) => {
+  // Which model rows are mid-write. The list has one checkbox per model, so
+  // this is the control the operator clicks dozens of times in a row; echoing
+  // the press locally keeps each click independent instead of queueing behind
+  // the Host round trip that redraws the whole list.
+  const [pendingModels, setPendingModels] = useState({})
+
+  const toggle = useCallback(async (id) => {
     const off = disabledModels.includes(id)
-    set('disabledModels', off ? disabledModels.filter((each) => each !== id) : [...disabledModels, id])
+    const next = off
+      ? disabledModels.filter((each) => each !== id)
+      : [...disabledModels, id]
+    setPendingModels((prev) => ({ ...prev, [id]: !off }))
+    const accepted = await set('disabledModels', next)
+    setPendingModels((prev) => {
+      if (!(id in prev)) return prev
+      const rest = { ...prev }
+      delete rest[id]
+      if (accepted !== true) rest[id] = !off
+      return rest
+    })
   }, [disabledModels, set])
 
-  const setAll = useCallback((serve) => {
+  // Echoed wholesale: the click lands on every row at once, so there is no
+  // per-row pending state to wait on and the whole list waits for the Host.
+  const setAll = useCallback(async (serve) => {
     const catalogIds = (Array.isArray(remote?.catalog) ? remote.catalog : []).map((row) => row.id)
     const keep = disabledModels.filter((id) => !catalogIds.includes(id))
-    set('disabledModels', serve ? keep : [...new Set([...keep, ...catalogIds])])
+    const pending = {}
+    for (const id of catalogIds) pending[id] = serve
+    setPendingModels(pending)
+    const accepted = await set('disabledModels', serve ? keep : [...new Set([...keep, ...catalogIds])])
+    if (accepted === true) setPendingModels({})
   }, [remote, disabledModels, set])
 
   const addManual = useCallback(() => {
@@ -541,10 +642,16 @@ function OpenCodeFreeSettings(props) {
   // of a key, is what unlocks the two keyed rules.
   const keyVerified = remote?.keyVerified === true
   const policyValue = QUOTA_POLICIES.includes(value.quotaPolicy) ? value.quotaPolicy : 'publicOnly'
+  // Keys with something in them, counted locally. The Host's `keyCount` can lag
+  // by a settings round trip; this is what the operator just typed, and it is
+  // what the verify button is gated on. Declared before its first use — a
+  // `const` referenced earlier in the same scope throws on render, which is how
+  // this page went blank for a whole release.
+  const filledKeyCount = keyValues.filter((v) => v.trim() !== '').length
   // The verdict to show: this page's own answer if the operator just pressed
   // the button, otherwise whatever the Host last persisted.
   const verdict = keyCheck !== null ? keyCheck : remote?.keyCheck
-  const keyCheckLine = keyCount === 0
+  const keyCheckLine = filledKeyCount === 0
     ? t('noKeyOnly')
     : (verdict === null || verdict === undefined
       ? t('keyUnchecked')
@@ -564,9 +671,9 @@ function OpenCodeFreeSettings(props) {
     h('label', { style: { ...ROW, marginTop: 6 } },
       h('input', {
         type: 'checkbox',
-        checked: value.enabled !== false,
+        checked: tickOf('enabled', value.enabled !== false),
         disabled: !writable,
-        onChange: (event) => { set('enabled', event.target.checked) },
+        onChange: (event) => { void toggleBoolean('enabled', event.target.checked) },
       }),
       h('span', { style: { fontSize: 13 } }, t('enabled'))),
     h('p', { style: NOTE }, t('enabledHint')),
@@ -593,7 +700,12 @@ function OpenCodeFreeSettings(props) {
     // Only the count here. Whether those keys are usable, and whether the
     // current rule would ever spend them, are shown next to the rule itself —
     // one fact per line, so nothing has to be inferred.
-    keyCount > 0 ? h('p', { style: NOTE }, t('keyConfigured', { count: keyCount, policy: t(`policy${policyValue[0].toUpperCase()}${policyValue.slice(1)}`) })) : null,
+    filledKeyCount > 0
+      ? h('p', { style: NOTE }, t('keyConfigured', {
+        count: filledKeyCount,
+        policy: t(`policy${policyValue[0].toUpperCase()}${policyValue.slice(1)}`),
+      }))
+      : null,
 
     // ---- catalog ----
     h('div', { style: { ...ROW, marginTop: 12 } },
@@ -634,7 +746,7 @@ function OpenCodeFreeSettings(props) {
         h('input', {
           type: 'checkbox',
           title: t('serve'),
-          checked: !row.disabled && !row.unavailable,
+          checked: pendingModels[row.id] ?? (!row.disabled && !row.unavailable),
           disabled: !writable || row.unavailable,
           onChange: () => { toggle(row.id) },
         }),
@@ -702,9 +814,9 @@ function OpenCodeFreeSettings(props) {
     h('label', { style: { ...ROW, marginTop: 12 } },
       h('input', {
         type: 'checkbox',
-        checked: value.autoSync !== false,
+        checked: tickOf('autoSync', value.autoSync !== false),
         disabled: !writable,
-        onChange: (event) => { set('autoSync', event.target.checked) },
+        onChange: (event) => { void toggleBoolean('autoSync', event.target.checked) },
       }),
       h('span', { style: { fontSize: 13 } }, t('autoSync'))),
     h('p', { style: NOTE }, t('autoSyncHint')),
@@ -725,18 +837,52 @@ function OpenCodeFreeSettings(props) {
     h('label', { style: { ...ROW, marginTop: 12 } },
       h('input', {
         type: 'checkbox',
-        checked: value.includeDeprecated === true,
+        checked: tickOf('includeDeprecated', value.includeDeprecated === true),
         disabled: !writable,
         onChange: (event) => {
           const show = event.target.checked
           // The Host decides which rows it serves, so the page has to re-read
-          // them — after the write lands, not before.
-          void set('includeDeprecated', show).then(() => { void load(false) })
+          // them — after the write lands, not before. The tick itself is
+          // echoed at once so the click does not wait on that round trip.
+          void toggleBoolean('includeDeprecated', show).then(() => { void load(false) })
         },
       }),
       h('span', { style: { fontSize: 13 } }, t('includeDeprecated'))),
+    h('p', { style: NOTE }, t('includeDeprecatedHint')),
 
-    h('label', { style: LABEL }, t('apiKeyEnv')),
+    h('label', { style: LABEL }, t('retry')),
+    h('div', { style: { ...ROW, marginTop: 4, alignItems: 'center' } },
+      h('span', { style: { fontSize: 12.5, opacity: 0.8 } }, t('retryAttempts')),
+      h('input', {
+        style: { ...INPUT, width: 90 },
+        type: 'number',
+        min: 1,
+        max: 20,
+        value: String(clampAttempts(value.maxRequestAttempts)),
+        disabled: !writable,
+        onChange: (event) => {
+          const next = Number(event.target.value)
+          if (Number.isFinite(next) && next >= 1) set('maxRequestAttempts', Math.min(20, Math.floor(next)))
+        },
+      }),
+      h('span', { style: { fontSize: 12.5, opacity: 0.8, marginLeft: 16 } }, t('retryBackoff')),
+      h('input', {
+        style: { ...INPUT, width: 110 },
+        type: 'number',
+        min: 100,
+        max: 30_000,
+        step: 100,
+        value: String(clampBackoff(value.retryBackoffMs)),
+        disabled: !writable,
+        onChange: (event) => {
+          const next = Number(event.target.value)
+          if (Number.isFinite(next) && next >= 100) set('retryBackoffMs', Math.min(30_000, Math.floor(next)))
+        },
+      }),
+    ),
+    h('p', { style: NOTE }, t('retryHint')),
+
+    h('label', { style: LABEL }, t('apiKeys')),
     h('p', { style: { ...NOTE, margin: '0 0 6px' } },
       h('a', {
         href: 'https://opencode.ai/zen',
@@ -744,14 +890,40 @@ function OpenCodeFreeSettings(props) {
         rel: 'noreferrer noopener',
         style: { color: 'inherit', textDecoration: 'underline' },
       }, t('zenKey'))),
-    h('input', {
-      style: INPUT,
-      value: typeof value.apiKeyEnv === 'string' ? value.apiKeyEnv : '',
-      disabled: !writable,
-      onChange: (event) => { set('apiKeyEnv', event.target.value) },
-    }),
-    h('p', { style: NOTE }, t('apiKeyHint')),
-    h('p', { style: NOTE }, t('zenKeyHint')),
+
+    // ---- key editor ----
+    // One row per key, value only. The environment variable name is derived
+    // from the row's position and shown read-only, because "set an environment
+    // variable" is a step most operators should never have to take — and one
+    // they cannot complete without restarting the process, which is what made
+    // a freshly added key read as "no key" and left Verify dead.
+    ...keyValues.map((keyValue, index) => h('div', { key: `key-${index}`, style: { ...ROW, marginTop: 4 } },
+      h('span', { style: { fontSize: 10.5, opacity: 0.6, width: 150, flexShrink: 0 } }, apiKeyNameFor(index)),
+      h('input', {
+        style: { ...INPUT, flex: 1 },
+        type: 'text',
+        autoComplete: 'off',
+        spellCheck: false,
+        placeholder: 'sk-…',
+        value: keyValue,
+        disabled: !writable,
+        onChange: (event) => { void replaceKey(index, event.target.value) },
+      }),
+      h('button', {
+        type: 'button',
+        style: { ...BUTTON, padding: '4px 8px' },
+        disabled: !writable,
+        title: t('keyRemove'),
+        onClick: () => { void removeKey(index) },
+      }, '×'))),
+    h('div', { style: { ...ROW, marginTop: 6 } },
+      h('button', {
+        type: 'button',
+        style: BUTTON,
+        disabled: !writable,
+        onClick: () => { void addKey() },
+      }, t('keyAdd'))),
+    h('p', { style: NOTE }, t('apiKeysHint')),
 
     // ---- usage rule ----
     // Three options, not a boolean: "I have a key" and "use my key" are
@@ -780,14 +952,23 @@ function OpenCodeFreeSettings(props) {
     h('p', { style: NOTE }, t(`policy${String(policyValue)[0].toUpperCase()}${String(policyValue).slice(1)}Hint`)),
 
     // ---- key verification ----
+    // Enabled by what the operator typed, not by what the Host has parsed yet:
+    // gating it on `keyCount` made the button dead for exactly the people who
+    // had just added a key, which reads as "nothing happens when I click".
     h('div', { style: { ...ROW, marginTop: 8 } },
       h('button', {
         type: 'button',
         style: BUTTON,
-        disabled: !writable || verifying || keyCount === 0,
+        disabled: !writable || verifying || filledKeyCount === 0,
         onClick: () => { void verifyKey() },
       }, verifying ? t('verifying') : t('verifyKey')),
       h('span', { style: { fontSize: 11.5, opacity: 0.85 } }, keyCheckLine)),
+    // The Host only learns about a key on the next settings change, so there is
+    // a window where the page has one and the Host does not. Saying so is the
+    // difference between "waiting" and "broken".
+    filledKeyCount > 0 && keyCount === 0
+      ? h('p', { style: { ...NOTE, color: '#ff9f6b' } }, t('keyPending'))
+      : null,
     h('p', { style: NOTE }, t('laneRule')),
 
     h('label', { style: LABEL }, t('bridgePort')),
@@ -825,6 +1006,31 @@ const name = 'dsh-connect-opencode-free-client'
  * from ever running. `slots` and `locale` are the two every line ships.
  */
 const inject = ['slots', 'locale']
+
+/**
+ * The retry count to show in the input.
+ *
+ * The schema default is the operator's real behaviour when they have never
+ * touched the field, so an absent value has to read as that default rather than
+ * as an empty box they might "fix" into a lower number.
+ * @param value - the stored `maxRequestAttempts`, possibly undefined.
+ * @returns a number safe to put in the input.
+ */
+function clampAttempts(value) {
+  return clampInt(value, 1, 20, 10)
+}
+
+/**
+ * The initial backoff to show in the input.
+ *
+ * Same reasoning as {@link clampAttempts}: a profile written before this field
+ * existed reads as the default, not as zero.
+ * @param value - the stored `retryBackoffMs`, possibly undefined.
+ * @returns a number safe to put in the input.
+ */
+function clampBackoff(value) {
+  return clampInt(value, 100, 30_000, 800)
+}
 
 /**
  * Mount the settings page and the form binding behind it.

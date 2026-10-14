@@ -17,16 +17,17 @@
 
 ## 架构
 
-| 半边 | 文件 | 职责 |
-| --- | --- | --- |
-| 共享纯逻辑 | `lib/core.js` | 模型集合合并、provider 条目生成、命名空间解析。无依赖，宿主与浏览器共用 |
-| 运行时配置 | `lib/config.js` | schemastery Config，除缓存目录外全部 `volatile` |
-| 模型发现 | `lib/discovery.js` | 合并 `opencode.ai/zen/v1/models` 与 `models.dev/api.json` |
-| 额度与密钥 | `lib/quota.js` | 429 记账与恢复时间估算、密钥解析（凭据库优先、环境变量兜底）、公共通道冷却、缓存读写 |
-| Key 校验 | `lib/keycheck.js` | 用一个最小请求证明 Key 被 Zen 接受；按指纹持久化，不存 Key 本身 |
-| 宿主 | `lib/index.js` | 注册 `opencode-free` 路由、周期发现、目录缓存、本机目录桥 |
-| 适配器 | `lib/provider.js` | 免 key 的 OpenAI 兼容 adapter：流式块边界、工具调用、推理档位、退避重试 |
-| 浏览器 | `src/client.js` | React 设置页，注册进 `settings.section` 槽位 |
+| 半边     | 文件                             | 职责                                                     |
+| ------ | ------------------------------ | ------------------------------------------------------ |
+| 共享纯逻辑  | `lib/core.js`                  | 模型集合合并、provider 条目生成、命名空间解析。无依赖，宿主与浏览器共用               |
+| 运行时配置  | `lib/config.js`                | schemastery Config，除缓存目录外全部 `volatile`                 |
+| 模型发现   | `lib/discovery.js`             | 合并 `opencode.ai/zen/v1/models` 与 `models.dev/api.json` |
+| 额度与密钥  | `lib/quota.js`                 | 429 记账与恢复时间估算、密钥解析（凭据库优先、环境变量兜底）、公共通道冷却、缓存读写           |
+| Key 校验 | `lib/keycheck.js`              | 用一个最小请求证明 Key 被 Zen 接受；按指纹持久化，不存 Key 本身                |
+| Key 录入 | `lib/core.js` + `lib/index.js` | 行号 → 环境变量名的映射（`apiKeyNameFor`）与注入/撤回                   |
+| 宿主     | `lib/index.js`                 | 注册 `opencode-free` 路由、周期发现、目录缓存、本机目录桥                  |
+| 适配器    | `lib/provider.js`              | 免 key 的 OpenAI 兼容 adapter：流式块边界、工具调用、推理档位、退避重试         |
+| 浏览器    | `src/client.js`                | React 设置页，注册进 `settings.section` 槽位                    |
 
 浏览器半边的产物 `lib/client.cjs` 由 `scripts/build.mjs` 从 `lib/core.js` + `src/client.js` 生成 —— 客户端模块系统的 `require` 只能解析包名和平台种子词，无法解析相对路径，所以共享逻辑必须内联。构建脚本还会拒绝任何未被内联的相对 import。
 
@@ -36,34 +37,34 @@
 
 ### 方式一：npm 安装（推荐）
 
-1. 进入目标 profile 目录（如 `~/.dsh/profiles/<profile-name>`）。
-2. 在 `package.json` 的 `dependencies` 加入：
+1. 进入目标 profile 目录（如 `~/.dsh/profiles/<profile-name>/`）。
+2. 在 `package.json` 的 `dependencies` 中加入：
    ```json
-   "dsh-connect-opencode-free": "^0.3.0"
+   "dsh-connect-opencode-free": "^0.4.0"
    ```
-3. 在 `dsh.profile.bundles` 数组里加入包名：
+3. 在 `dsh.profile.bundles` 数组中加入包名：
    ```json
    "dsh-connect-opencode-free"
    ```
-4. 执行安装：
+4. 在该 profile 目录执行安装：
    ```sh
    pnpm install
    ```
-5. 启动对应 profile（如 `dsh web`），打开「设置 → OpenCode 免费模型」即可使用。
+5. 重启 dsh（如 `dsh web`），打开「设置 → OpenCode 免费模型」即可使用。
 
 ### 方式二：从源码运行（开发态）
 
 1. clone 本仓库到本地。
-2. 在 profile 的 `package.json` 中用 `link:` 指向源码绝对路径：
+2. 在 profile 的 `package.json` 的 `dependencies` 中用 `link:` 指向源码绝对路径：
    ```json
    "dsh-connect-opencode-free": "link:/absolute/path/to/dsh-connect-opencode-free"
    ```
-3. 同样在 `dsh.profile.bundles` 加入包名。
+3. 同样在 `dsh.profile.bundles` 数组中加入包名。
 4. 执行 `pnpm install`，重启 dsh。
 
 依赖要求：Node ≥ 18，且宿主提供 `@deepseek-ai/dsh-llm`（peer 范围 `>=0.1.7-rc.1 <0.3.0`）。`cordis.patch.yml` 由 `package.json` 的 `dsh.bundle.patch` 自动加载，无需手动处理。
 
-> 提示：宿主半边的 `lib/` 为源码，`lib/client.cjs` 是 `npm run build` 生成的浏览器半边产物；若该 bundle 需要随仓库分发，请确保已执行构建（或仅在此开发树内 `link` 使用）。
+> 提示：宿主半边的 `lib/` 为源码，`lib/client.cjs` 是 `npm run build` 生成的浏览器半边产物；从源码运行前请先执行 `npm run build`。
 
 ## 模型发现
 
@@ -88,38 +89,39 @@ Zen 的模型接口不返回 `Access-Control-Allow-Origin`，浏览器读不到�
 
 打开「设置 → OpenCode 免费模型」。所有字段 `volatile`，改完立即生效，不需要重启。
 
-| 字段 | 默认值 | 说明 |
-| --- | --- | --- |
-| `enabled` | `true` | 总开关；关闭后所有免费模型撤下 |
-| `zenBaseURL` | `https://opencode.ai/zen/v1` | Zen 接口根 |
-| `catalogURL` | `https://models.dev/api.json` | 模型目录 |
-| `autoSync` | `true` | 持续发现 |
-| `pollIntervalMs` | `3600000` | 发现间隔 |
-| `catalogTimeoutMs` | `20000` | 目录请求超时 |
-| `includeDeprecated` | `false` | 在设置页列出 models.dev 已弃用的免费模型，勾选后一并服务（Zen 已下架的仍标记为不可用） |
-| `apiKeyEnv` | `OPENCODE_API_KEY` | **私有额度**密钥的环境变量名，逗号分隔轮换，先查凭据库再查环境变量；是否动用由 `quotaPolicy` 决定 |
-| `quotaPolicy` | `publicOnly` | 使用规则：`publicOnly` 仅用公共额度；`preferPublic` 公共优先、被拒时回退私有；`preferKey` 私有优先、失败时回退公共。后两者需先通过 Key 校验 |
-| `maxRequestAttempts` | `3` | 单次请求最多尝试次数 |
-| `retryBackoffMs` | `800` | 重试初始退避，按次数指数增长 |
-| `defaultContextWindow` | `200000` | 目录未给大小时的兜底 |
-| `realGateTools` | `true` | 把网关要求的 `bash`/`read` 注册成真实可执行工具；关闭后它们只是占位，模型调用会被忽略并提示（**即时生效**，无需重启） |
-| `disabledModels` | `[]` | 停用的模型 id |
-| `manualModels` | `[]` | 手动添加的模型 |
-| `bridgePort` | `18766` | 目录桥端口 |
-| `cachePath` | `''` | 缓存文件；留空用 `<DSH_HOME>/cache/` |
-| `debug` | `false` | 宿主输出详细日志 |
+| 字段                     | 默认值                           | 说明                                                                                           |
+| ---------------------- | ----------------------------- | -------------------------------------------------------------------------------------------- |
+| `enabled`              | `true`                        | 总开关；关闭后所有免费模型撤下                                                                              |
+| `zenBaseURL`           | `https://opencode.ai/zen/v1`  | Zen 接口根                                                                                      |
+| `catalogURL`           | `https://models.dev/api.json` | 模型目录                                                                                         |
+| `autoSync`             | `true`                        | 持续发现                                                                                         |
+| `pollIntervalMs`       | `3600000`                     | 发现间隔                                                                                         |
+| `catalogTimeoutMs`     | `20000`                       | 目录请求超时                                                                                       |
+| `includeDeprecated`    | `false`                       | 是否列出**已下架**的免费模型。默认不列出任何已下架的：models.dev 标记弃用的，以及 Zen 已下架的。勾选后两者都列出，但 Zen 已下架的仍标记为不可用，勾了也无法调用 |
+| `apiKeys`              | `[]`                          | **私有额度 Key 列表**，逐行填值即可；保存后按 `OPENCODE_API_KEY`、`OPENCODE_API_KEY_1`… 自动写入进程环境变量，删行即撤回        |
+| `apiKeyEnv`            | `''`                          | 高级：自管密钥时填已有环境变量名（逗号分隔轮换），仅在 `apiKeys` 为空时生效                                                  |
+| `quotaPolicy`          | `publicOnly`                  | 使用规则：`publicOnly` 仅用公共额度；`preferPublic` 公共优先、被拒时回退私有；`preferKey` 私有优先、失败时回退公共。后两者需先通过 Key 校验 |
+| `maxRequestAttempts`   | `10`                          | 单次请求最多尝试次数（429 与所有 5xx 都会退避重试；上限 20）                                                            |
+| `retryBackoffMs`       | `800`                         | 重试初始退避，按次数指数增长                                                                               |
+| `defaultContextWindow` | `200000`                      | 目录未给大小时的兜底                                                                                   |
+| `realGateTools`        | `true`                        | 把网关要求的 `bash`/`read` 注册成真实可执行工具；关闭后它们只是占位，模型调用会被忽略并提示（**即时生效**，无需重启）                         |
+| `disabledModels`       | `[]`                          | 停用的模型 id                                                                                     |
+| `manualModels`         | `[]`                          | 手动添加的模型                                                                                      |
+| `bridgePort`           | `18766`                       | 目录桥端口                                                                                        |
+| `cachePath`            | `''`                          | 缓存文件；留空用 `<DSH_HOME>/cache/`                                                                 |
+| `debug`                | `false`                       | 宿主输出详细日志                                                                                     |
 
-页面提供：搜索、逐个启停、全部启用/停用、一键写入 `llm-pi-ai.providers.opencode-zen`、移除 provider、手动添加模型、公共额度的限流/被拒状态与恢复时间、三档使用规则选择，以及 Key 校验按钮与结果。
+页面提供：搜索、逐个启停、全部启用/停用、一键写入 `llm-pi-ai.providers.opencode-zen`、移除 provider、手动添加模型、公共额度的限流/被拒状态与恢复时间、三档使用规则选择，以及逐行录入的 Key 列表与校验按钮。
 
 ## 使用规则：三档额度策略
 
 「设置 → OpenCode 免费模型」底部的 **使用规则** 决定一次调用可以花谁的额度。默认是 **仅使用公共额度**——本插件的意义是免 key，所以一个恰好躺在环境变量里的 Key 不会自动变成所有调用的计费对象。
 
-| 规则 | 值 | 顺序 | 需要 Key 校验 |
-| --- | --- | --- | --- |
-| **仅使用公共额度** | `publicOnly` | 只用公共额度，配了 Key 也不动用 | 否（默认） |
-| **优先使用公共额度** | `preferPublic` | 公共 → Key1 → Key2 → … | **是** |
-| **优先使用私有额度** | `preferKey` | Key1 → Key2 → … → 公共 | **是** |
+| 规则           | 值              | 顺序                   | 需要 Key 校验 |
+| ------------ | -------------- | -------------------- | --------- |
+| **仅使用公共额度**  | `publicOnly`   | 只用公共额度，配了 Key 也不动用   | 否（默认）     |
+| **优先使用公共额度** | `preferPublic` | 公共 → Key1 → Key2 → … | **是**     |
+| **优先使用私有额度** | `preferKey`    | Key1 → Key2 → … → 公共 | **是**     |
 
 后两档必须**先通过 Key 校验**才可选用。校验方式是向 Zen 发一个最小请求，只问一个问题——「这个 Key 被接受了吗」。只有 401/403 算不通过；400（模型/参数问题）、429（该账号限流）都发生在鉴权之后，因此反而证明 Key 是真的。校验结果带 Key 的指纹持久化（不存 Key 本身），**换了 Key 自动失效**，需要重新校验。
 
@@ -158,7 +160,7 @@ Zen 的模型接口不返回 `Access-Control-Allow-Origin`，浏览器读不到�
 
 ### 三档共用的规则
 
-- **多 Key 轮换。** `apiKeyEnv` 填多个环境变量名（逗号分隔）会轮换使用；只有真正动用到 Key 的请求才推进轮换起点，被公共额度服务的请求不会打乱它。
+- **多 Key 轮换。** 列表里第 N 个 Key 会按 `OPENCODE_API_KEY`、`OPENCODE_API_KEY_1`… 轮换使用；只有真正动用到 Key 的请求才推进轮换起点，被公共额度服务的请求不会打乱它。
 - **一轮就是预算。** 一次调用最多把当前规则序列里的凭据各试一次；此后只有可重试的错误（429/5xx）才值得再等一轮，避免在同一个答案上空转。
 - **两条都失败时报 Key 的错误。** 公共额度不可用你已经知道了，需要修的是 Key；报错会带上出事的凭据名，多 Key 时不会被最后一个误导。
 
@@ -167,9 +169,43 @@ Zen 的模型接口不返回 `Access-Control-Allow-Origin`，浏览器读不到�
 Key 是可选的。公共额度能用的时候不需要它。
 
 1. 到 <https://opencode.ai/zen> 领取 Key。
-2. 打开「设置 → OpenCode 免费模型」，在 **私有额度 Key（环境变量名）** 里填一个名字，默认 `OPENCODE_API_KEY`（多个用逗号分隔）。
-3. 把 Key 的值放进这个环境变量，**或者**在宿主的凭据库里以同名保存（**优先查凭据库**，再查环境变量）。设置页保存的 Key 走凭据库，不会写进环境。
+2. 打开「设置 → OpenCode 免费模型」，在 **私有额度 Key** 一栏点「添加 Key」，**逐行粘贴 Key 的值**——不需要配置环境变量，变量名由行号自动生成（第 1 行 `OPENCODE_API_KEY`，第 2 行 `OPENCODE_API_KEY_1`，依此类推），显示在每行左侧，只读。
+3. 保存即生效：插件把每行的值写进**进程环境变量**（重启后由配置重新注入，不会丢），并立即刷新凭据池。
 4. 点 **「校验 Key」**。通过后，后两档规则才变为可选；设置页会显示「已配置 N 个 Key · 当前规则：X」。
+
+> **为什么要这样做**：早先版本要求使用者自己建环境变量再重启进程。两步都容易漏——尤其是重启，改完环境变量不重启，运行中的进程根本读不到，插件会一直认为"没有 Key"，校验按钮也就一直点不动。现在 Key 存在插件配置里，环境变量只是它的投影，改了立刻可见。
+
+Key 值以明文存在 profile 的配置补丁中（与宿主凭据库同等级别）。若你的部署已有自己的密钥管理，可改用高级字段 `apiKeyEnv`：填上已有的环境变量名（逗号分隔），它只在 Key 列表为空时生效，两者不会同时生效。
+
+> 删除某一行会同时撤回对应的环境变量，不会留下一个页面已删、进程仍在用的 Key。
+
+### 报错：「Key 校验未通过：Key 未被接受（HTTP 403）」
+
+```
+Key 校验未通过：Key 未被接受（HTTP 403）：
+{"type":"error","error":{"type":"FreeTierError", …}}
+```
+
+**这通常不代表 Key 是错的。** Zen 网关在读取凭据**之前**就会检查请求是否像 OpenCode CLI 发出的；没通过就返回 403 `FreeTierError`，而它对「Key 错误」和「请求形态不对」给的是**同一个**错误。校验探针必须同时带上四个信号（2026-10-14 实测，缺任意一个都变回 403）：
+
+| # | 信号 | 由谁提供 |
+| --- | --- | --- |
+| 1 | `User-Agent` 以 `opencode/` 开头 | 插件固定伪装 |
+| 2 | `x-opencode-session` 是**真实**的会话 id | 读本机 `opencode.db`，不是伪造 |
+| 3 | body 的 `tools` 含 `bash` / `read` | 插件注入 |
+| 4 | `stream: true` | OpenCode CLI 从不发非流式请求 |
+
+第 4 条尤其隐蔽：探针原本用 `stream: false`「只要状态码不要正文」，看起来更省，实际直接被网关判成非 CLI 流量。现在的探针与真实请求走完全相同的构造。
+
+若四个信号都在（当前版本即如此）仍然 403，那才是 Key 真的有问题。独立复核：
+
+```sh
+node scripts/verify-key-fix.mjs oc_sk_你的key
+```
+
+三个模型全 PASS 即 Key 有效。
+
+> 另一个方向的误解也要避免：**公共额度能不能用，与 Key 无关**。公共通道只靠前三个信号（它本来就没有 Key）。若公共额度报同一个 403，去查会话与伪装，不要去翻 Key。
 
 ## 报错：OpenCode Zen 拒绝了匿名免费档调用（HTTP 403）
 
@@ -181,11 +217,11 @@ OpenCode's free tier can only be used from within OpenCode. …
 
 这句话的真实含义是：**网关没把这次请求认成 OpenCode CLI 发起的**。它同时放行必须满足三个条件，缺一个就 403：
 
-| 条件 | 要求 | 本插件怎么满足 |
-| --- | --- | --- |
-| `User-Agent` | 以 `opencode/` 开头 | 匿名通道伪装成 CLI 的 UA |
+| 条件                   | 要求                                      | 本插件怎么满足                         |
+| -------------------- | --------------------------------------- | ------------------------------- |
+| `User-Agent`         | 以 `opencode/` 开头                        | 匿名通道伪装成 CLI 的 UA                |
 | `x-opencode-session` | **OpenCode 真实创建过**的会话 id（`ses_` + 26 位） | 从本机 OpenCode 的 SQLite 会话库读取最近一条 |
-| 请求体的 `tools` | 必须含 `bash` 和 `read` | 把这两个名字注册成真实可执行的工具 |
+| 请求体的 `tools`         | 必须含 `bash` 和 `read`                     | 把这两个名字注册成真实可执行的工具               |
 
 ### 排查顺序
 
@@ -200,6 +236,37 @@ OpenCode's free tier can only be used from within OpenCode. …
 
 保持默认的「仅使用公共额度」即可——这正是默认值，不需要配 Key 也不需要额外操作。此时 429/403 就是终点，插件不会去找 Key。
 
+## 报错：设置页整页空白 / 「校验 Key」按钮不见了
+
+页面整个区域是空的，但 Host 正常、模型照常调用，日志里只有一行：
+
+```
+[opencode-free] client page failed to load (host provider unaffected): TypeError: …
+```
+
+这是**页面在渲染期抛了异常**，被 `apply` 的 try/catch 吞掉后只剩这行日志——Host 半边完全不受影响，所以看起来"插件没坏，只是设置打不开"。渲染期抛错只有三种来源：
+
+| 现象                     | 根因                                                 | 现状                                                           |
+| ---------------------- | -------------------------------------------------- | ------------------------------------------------------------ |
+| 整页空白                   | 页面组件里一个 `const` 在声明前被读取（TDZ），渲染时抛 `ReferenceError` | 已修（2026-10-14）。`npm run smoke` 的 `tdz-scan` 静态扫描 + 渲染冒烟双保险守住 |
+| 链接显示成 `zenKey` 这样的原始键名 | 页面请求了一个语言表里不存在的翻译键                                 | 已修（2026-10-14，`zenKey` 中英双语补全）。`smoke-page.mjs` 会逐个核对        |
+| 改了页面源码、重启后仍是旧行为        | `lib/client.cjs` 是生成产物，重启不重建它                      | 见[开发](#改设置页后必须重新构建光重启无效)：`npm run build` + 重启 + 浏览器硬刷新       |
+
+最后一栏是这次实际踩的坑：TDZ 缺陷在 `src/client.js` 里早就修好了，但产物没重建，于是**重启 dsh web 多少次都还是白屏**，按钮自然也一直点不到。先 `npm run smoke` 确认三关全过，再重启。
+
+## 报错：点任何复选框都要等一下才生效
+
+已修（2026-10-14）。根因不在页面，页面整块重绘只要 **0.09ms**；慢在**点击会牵连整个应用重载模型目录**。
+
+一次设置写入会触发 `loader/volatile-update`，插件原先在这里**无条件**调用 `providerHandle.replace([PROVIDER])`。这个 `replace()` 不是幂等的 setter：它删掉再重新注册路由，并广播 `llm/adapters-updated`。而这个广播有四个订阅者——模型选择器、设置页模型列表、子智能体列表、账号页——每一个都通过 `ctx.remote.$on` 跨线应答，重新拉一次完整目录。`catalog.invalidate()` 会丢弃 in-flight 请求，所以这些刷新**不会被合并**，点一个模型行的勾选框，全应用要重载四份目录。
+
+现在有两道处理：
+
+1. **只在路由真的变了才 `replace()`**（`routesChanged()`，抽在 `core.js` 里有测试）。改一个模型的启停状态不再动路由表；只有「启用插件」开关本身会改，而它本就应该广播——暂停时路由要撤掉，否则模型选择器会留着旧列表。
+2. **勾选框乐观回显**。点击立刻改本地状态，Host 确认后对齐；写入被拒则弹回原值。这样即使写入要经过一次往返，手感也是即时的。
+
+`refreshKeyed()`（重查凭据池）**刻意没有**加同样的守卫：凭据也可能在插件之外被改（账号页），跳过查询会让徽标描述一把已经不存在的 Key。它是 fire-and-forget，本来就不在点击路径上。
+
 ## 兼容性
 
 浏览器半边的 `inject` 只有 `['slots', 'locale']` —— 这两个服务在任何 Host 版本上都存在。设置服务 `configForms` 通过 `ctx.get()` 软探测：Cordis 的依赖门是硬性的，声明一个当前 Host 没有提供的服务会让 `apply` 永不执行，页面直接消失。
@@ -211,8 +278,26 @@ OpenCode's free tier can only be used from within OpenCode. …
 ```sh
 npm run build    # 生成 lib/client.cjs
 npm run verify   # 校验产物是否最新
+npm run smoke    # 构建 + TDZ 扫描 + 设置页渲染冒烟
 npm test         # 单元测试
 ```
+
+### 改设置页后必须重新构建，光重启无效
+
+`lib/client.cjs` 是**生成产物**（`scripts/build.mjs` 把 `lib/core.js` + `src/client.js` 内联成浏览器工厂），浏览器加载的是它，不是 `src/client.js`。因此改完页面源码后：
+
+1. `npm run build`（或 `npm run smoke`，它包含构建）；
+
+
+1. 重启 `dsh web`；
+2. 浏览器硬刷新（Ctrl+F5），否则拿到的是缓存里的旧工厂。
+
+只重启进程、不重新构建，页面会继续表现旧代码的行为——包括旧缺陷。已经因此吃过一次：页面空白的根因（一个 `const` 在声明前被读取）早已在 `src/client.js` 里修好，但产物没重建，重启多少次都还是白屏。
+
+`npm run smoke` 守住的正是这类只在渲染期现形的缺陷：
+
+- `scripts/tdz-scan.mjs` —— 静态扫描页面组件里「先读后声明」的局部变量。这类错误 `node --check` 看不见，单元测试也不导入页面，只会在渲染时抛 `ReferenceError`，表现为整页空白。扫描前会用一份还原了该缺陷的样件自证抓得到。
+- `scripts/smoke-page.mjs` —— 用 mock 的 `locale`/`slots`/`configForms` 驱动真实产物，把页面在 6 种配置状态（空 Key、已填 Key、两种 Key 门禁规则、手动模型、弃用开关）下各渲染一遍，逐个核对页面请求的翻译键都存在于语言表里。
 
 ## 致谢
 

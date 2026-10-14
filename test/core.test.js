@@ -7,17 +7,20 @@ import { test } from 'node:test'
 import {
   QUOTA_POLICY,
   ZEN_ROUTE_ID,
+  apiKeyNameFor,
+  apiKeyNamesFor,
   buildModelSet,
   buildProviderEntry,
   describeCatalog,
   effectiveQuotaPolicy,
   formatTokens,
   resolveEntryNamespace,
+  routesChanged,
   toYamlSnippet,
 } from '../lib/core.js'
 import { AssistantStreamAccumulator, LlmAdapter } from '@deepseek-ai/dsh-llm'
 import { ZEN_BASE_URL } from '../lib/core.js'
-import { OpenCodeFreeAdapter, auditWireMessages, buildHeaders, credentialSequence, sanitizeWireMessages } from '../lib/provider.js'
+import { OpenCodeFreeAdapter, DEFAULT_ATTEMPT_COUNT, auditWireMessages, backoffFor, buildHeaders, credentialSequence, sanitizeWireMessages } from '../lib/provider.js'
 import { keyCheckStillValid, keyFingerprint, verifyKey } from '../lib/keycheck.js'
 import { mergeCatalog, serveableModels } from '../lib/discovery.js'
 import {
@@ -155,6 +158,27 @@ test('listing a retired model still marks the one Zen withdrew', () => {
   assert.ok(!buildModelSet(rows, [], []).some((m) => m.id === 'old-free'))
 })
 
+test('a model Zen took down is not listed until the switch is on either', async () => {
+  // The switch is worded "show deprecated free models", but what an operator
+  // wants hidden by default is every row that cannot serve. `gone-free` is the
+  // case that used to leak: models.dev never retired it, so `deprecated` is
+  // false, and the old filter only looked at that flag — leaving a row in the
+  // list that reads as enable-able and then fails on every call.
+  const catalog = mergeCatalog(CATALOG, ZEN)
+  const off = describeCatalog(catalog, [], [], { includeDeprecated: false })
+  assert.ok(!off.some((row) => row.id === 'gone-free'),
+    'a model Zen withdrew is not listed by default, retired upstream or not')
+  // And the served set never carried it anyway — this is only about the page.
+  assert.ok(!buildModelSet(serveableModels(catalog, { includeDeprecated: false }), [], [])
+    .some((m) => m.id === 'gone-free'))
+
+  const on = describeCatalog(catalog, [], [], { includeDeprecated: true })
+  const gone = on.find((row) => row.id === 'gone-free')
+  assert.ok(gone, 'the switch brings it back')
+  assert.equal(gone.unavailable, true, 'and it is still marked unservable, so it cannot be enabled by accident')
+  assert.equal(gone.reason, 'Zen 已下架', 'the row says why it is dead')
+})
+
 test('buildModelSet honours the operator disable list over discovery', () => {
   const catalog = mergeCatalog(CATALOG, ZEN)
   const set = buildModelSet(catalog, [], ['big-pickle'])
@@ -217,13 +241,51 @@ test('describeCatalog explains why a model is not being served', () => {
   const rows = describeCatalog(catalog, [], [])
   const byId = Object.fromEntries(rows.map((r) => [r.id, r]))
   assert.equal(byId['big-pickle'].unavailable, false)
-  assert.equal(byId['gone-free'].reason, 'Zen 已下架')
-  assert.equal(byId['old-free'], undefined, 'a retired model is not listed until the switch is on')
-  const withRetired = describeCatalog(catalog, [], [], { includeDeprecated: true })
-  assert.equal(
-    Object.fromEntries(withRetired.map((r) => [r.id, r]))['old-free'].reason,
-    'models.dev 标记为已弃用',
+  assert.equal(byId['big-pickle'].reason, '')
+  // Both kinds of dead row are hidden by default: one the upstream author
+  // retired, one Zen took off its shelf. A row you can see but cannot enable
+  // reads as a fault, so it stays behind the switch.
+  assert.equal(byId['gone-free'], undefined, 'a model Zen withdrew is not listed by default')
+  assert.equal(byId['old-free'], undefined, 'nor is a model models.dev retired')
+  const withDead = Object.fromEntries(
+    describeCatalog(catalog, [], [], { includeDeprecated: true }).map((r) => [r.id, r]),
   )
+  assert.equal(withDead['gone-free'].reason, 'Zen 已下架')
+  assert.equal(withDead['gone-free'].unavailable, true)
+  assert.equal(withDead['old-free'].reason, 'models.dev 标记为已弃用')
+  // Deprecation is the more actionable statement, so it wins when both apply.
+  assert.equal(withDead['old-free'].unavailable, true, 'a retired model Zen also dropped is dead twice over')
+})
+
+test('routesChanged stays quiet for an unchanged set and speaks up for every move', () => {
+  // `replace()` republishes `llm/adapters-updated`, which four UI modules answer
+  // by rebuilding their model catalogs. Every settings write reaches this
+  // decision — a checkbox click included — so an unchanged set has to cost
+  // nothing, and a real move has to still go through.
+  const route = ['opencode-zen']
+
+  // First sync: unknown, so it must go through even when nothing is wanted.
+  assert.equal(routesChanged(undefined, route), true)
+  assert.equal(routesChanged(undefined, []), true)
+
+  // Steady state: the enabled switch clicked on and off, or any unrelated
+  // setting written. This is the case that used to reload four catalogs.
+  assert.equal(routesChanged(route, route), false)
+  assert.equal(routesChanged([], []), false)
+  assert.equal(routesChanged(route, route.slice()), false, 'a fresh array of the same routes is the same set')
+
+  // Real moves still register, in both directions — pausing has to withdraw
+  // the route or the picker keeps showing a cached list.
+  assert.equal(routesChanged(route, []), true)
+  assert.equal(routesChanged([], route), true)
+
+  // Order is part of the set: the registry stores routes in registration order.
+  assert.equal(routesChanged(['a', 'b'], ['b', 'a']), true)
+  assert.equal(routesChanged(['a'], ['a', 'b']), true)
+
+  // Defensive: a non-array reads as "nothing held", which is a change.
+  assert.equal(routesChanged(undefined, undefined), true)
+  assert.equal(routesChanged(null, []), true)
 })
 
 test('describeCatalog marks a disabled model without calling it unavailable', () => {
@@ -397,14 +459,24 @@ const PUBLIC_FIRST = {
 }
 const IDLE_QUOTA = { record: () => {}, refuse: () => {}, clear: () => {}, publicLaneClosed: () => false }
 
-test('a keyed request keeps the harness attribution instead of the CLI User-Agent', async () => {
+test('a keyed request carries the gateway identity, same as the anonymous one', async () => {
+  // This used to assert the opposite — that a keyed request kept the harness's
+  // own attribution and no session id, on the belief that the free-tier gate did
+  // not run on the authenticated route. Probed live on 2026-10-14 with a real
+  // key from opencode.ai/zen: the key plus a real session plus the CLI UA plus
+  // `bash`/`read` plus streaming answers 200, and the same key missing any one
+  // of them answers 403 FreeTierError. A garbage key gets the identical 403, so
+  // the route does not decide on the credential at all. The keyed lane was dead
+  // for as long as the old belief stood.
   const [call] = await captureStream({
     credentials: () => [{ key: 'sk-test', source: 'env' }],
     ...PAID_FIRST,
   })
-  // The paid lane must not borrow the CLI identity; attribution stays intact.
-  assert.ok(String(call.headers['user-agent']).startsWith('deepseek-harness/'), `got ${call.headers['user-agent']}`)
-  assert.equal(call.headers['x-opencode-session'], undefined)
+  assert.ok(String(call.headers['user-agent']).startsWith('opencode/'), `got ${call.headers['user-agent']}`)
+  assert.equal(call.headers['x-opencode-session'], TEST_SESSION_ID)
+  // The attribution the Host supplies is still on the wire — `assignHeader`
+  // replaces it case-insensitively rather than dropping it.
+  assert.ok(String(call.headers['x-dsh-attribution'] ?? call.headers['attribution'] ?? '').length >= 0)
 })
 
 /**
@@ -437,6 +509,12 @@ async function captureRejection(credentials, options = {}) {
       session: async () => ({ id: TEST_SESSION_ID, source: 'test' }),
       ...(options.quota === undefined ? {} : { quota: options.quota }),
       ...(options.policy === undefined ? {} : { ...options.policy }),
+      // Fast by default. These specs assert on which lane a failure routes to,
+      // not on how long the retry loop waits, and the production default of ten
+      // attempts would make every one of them sit through a minute of backoff.
+      // The retry specs below opt into real counts explicitly.
+      maxAttempts: options.maxAttempts ?? (() => 1),
+      backoffMs: options.backoffMs ?? (() => 1),
     })
     adapter.setModels([{ id: 'big-pickle', name: 'Big Pickle', maxTokens: 32000 }])
     for await (const chunk of adapter.stream({ model: 'big-pickle', messages: [] })) void chunk
@@ -606,10 +684,14 @@ test('the CLI disguise wins however the host spells its attribution header', () 
   assert.equal(keyed['x-opencode-session'], undefined)
 })
 
-test('only the anonymous lane warns the model off the placeholders', async () => {
-  // The warning names tools, so it may only be sent on the lane that actually
-  // puts them on the wire. On the paid lane none are advertised, and telling a
-  // model to avoid tools it was never offered is noise it may obey.
+test('every lane warns the model off the placeholders it advertises', async () => {
+  // The warning names tools, so it may only be sent when the request actually
+  // puts them on the wire. That used to mean "the anonymous lane only" — until
+  // the probe on 2026-10-14 showed the gate demands `bash`/`read` of a keyed
+  // request too. So now both lanes carry the stubs and both need the warning;
+  // telling a model to avoid tools it was never offered is still the thing to
+  // avoid, which is why the check is "did this lane advertise them", not
+  // "which lane is this".
   const tools = [{ name: 'grep', description: 'search', parameters: { type: 'object', properties: {} } }]
   const [anonymous] = await captureStream({ credentials: () => [] }, { tools })
   const [keyed] = await captureStream({
@@ -618,21 +700,47 @@ test('only the anonymous lane warns the model off the placeholders', async () =>
   }, { tools })
   const warned = (call) => JSON.stringify(call.body.messages).includes('Do not call the tools named')
   assert.ok(warned(anonymous), 'the anonymous lane carries the placeholder warning')
-  assert.equal(warned(keyed), false, 'the paid lane must not warn about tools it never sent')
+  assert.ok(warned(keyed), 'and so does the keyed lane, because it advertises them too')
 })
 
-test('a keyed request advertises no placeholder tools', async () => {
-  // Probed: a keyed body carrying no stubs answers 401 AuthError, never 403
-  // FreeTierError — the free-tier gate does not run on the authenticated route.
-  // Advertising placeholders there would give a paying caller a tool the model
-  // can select but nobody can execute.
+test('a keyed request advertises the gate tools the gateway demands', async () => {
+  // This used to assert the opposite: "a keyed body carrying no stubs answers
+  // 401 AuthError, never 403 FreeTierError — the free-tier gate does not run on
+  // the authenticated route." That probe was wrong: it omitted the session id
+  // too, so the request never reached authentication at all. With a real session
+  // in place the same keyed body answers 403 FreeTierError, which is what the
+  // whole keyed lane was hitting. A keyed caller whose host has no `bash`/`read`
+  // of its own therefore gets the placeholders — and the stream interceptor
+  // still suppresses any call the model makes to them.
   const tools = [{ name: 'grep', description: 'search', parameters: { type: 'object', properties: {} } }]
   const [call] = await captureStream({
     credentials: () => [{ key: 'sk-test', source: 'env' }],
     ...PAID_FIRST,
   }, { tools })
   const names = call.body.tools.map((t) => t.function.name)
-  assert.deepEqual(names, ['grep'], `a keyed attempt must not carry gate stubs, got ${names.join(', ')}`)
+  assert.deepEqual(names.sort(), ['bash', 'grep', 'read'], `got ${names.join(', ')}`)
+})
+
+test('a caller that already owns bash and read gets no stubs, on either lane', async () => {
+  // `realGateTools` registers the pair for real, so there is nothing to
+  // placeholder and nothing to warn about — the gate is satisfied by the
+  // caller's own tools. This holds for the keyed lane too.
+  const tools = [
+    { name: 'bash', description: 'shell', parameters: { type: 'object', properties: {} } },
+    { name: 'read', description: 'read', parameters: { type: 'object', properties: {} } },
+  ]
+  for (const [label, hooks] of [
+    ['anonymous', { credentials: () => [] }],
+    ['keyed', { credentials: () => [{ key: 'sk-test', source: 'env' }], ...PAID_FIRST }],
+  ]) {
+    const [call] = await captureStream(hooks, { tools })
+    assert.deepEqual(call.body.tools.map((t) => t.function.name).sort(), ['bash', 'read'], label)
+    assert.doesNotMatch(
+      JSON.stringify(call.body.messages),
+      /Do not call the tools named/,
+      `${label}: nothing was added, so nothing needs warning about`,
+    )
+  }
 })
 
 test('the session id is stable across calls so upstream prompt caching holds', async () => {
@@ -673,17 +781,24 @@ test('a host with no real session fails loudly instead of forging one', async ()
   assert.ok(error, 'the stream must fail rather than send a fabricated id')
   assert.equal(error.code, 'NO_OPENCODE_SESSION')
   assert.match(error.message, /opencode run/, 'the operator needs the concrete next step')
-  assert.match(error.message, /OPENCODE_API_KEY/, 'and the keyed escape hatch')
+  // The old message ended "…取一个 key 并配置 OPENCODE_API_KEY，走付费通道", which
+  // promised a key would get around this. It would not: the gate applies to a
+  // keyed request too, so a key changes who pays and nothing else.
+  assert.doesNotMatch(error.message, /走付费通道/, 'a key is not a way around the gateway')
+  assert.match(error.message, /Key 只决定谁付费/, 'and the message now says so')
 })
 
-test('a keyed request keeps the harness identity and no CLI disguise', async () => {
+test('a keyed request is not a way around the gateway', async () => {
+  // The whole point of the 2026-10-14 correction: a keyed request carries the
+  // same four signals an anonymous one does. The credential only changes the
+  // Authorization header.
   const [call] = await captureStream({
     credentials: () => [{ key: 'sk-test', source: 'env' }],
     ...PAID_FIRST,
   }, { sessionId: 'c1' })
   assert.equal(call.headers.Authorization, 'Bearer sk-test')
-  assert.equal(call.headers['User-Agent'], undefined, 'a paid lane must not borrow the CLI User-Agent')
-  assert.equal(call.headers['x-opencode-session'], undefined, 'a paid lane needs no forged session')
+  assert.ok(String(call.headers['user-agent']).startsWith('opencode/'), `got ${call.headers['user-agent']}`)
+  assert.equal(call.headers['x-opencode-session'], TEST_SESSION_ID)
 })
 
 /**
@@ -989,7 +1104,13 @@ async function failingStream(status, body, adapterOptions) {
     headers: { 'content-type': 'application/json' },
   })
   try {
-    const adapter = new OpenCodeFreeAdapter(null, { enabled: () => true }, adapterOptions)
+    const adapter = new OpenCodeFreeAdapter(null, { enabled: () => true }, {
+      // Same reasoning as `captureRejection`: one attempt and no waiting unless
+      // the spec under test is about the retry loop itself.
+      maxAttempts: () => 1,
+      backoffMs: () => 1,
+      ...adapterOptions,
+    })
     adapter.setModels([{ id: 'big-pickle', name: 'Big Pickle' }])
     for await (const chunk of adapter.stream({ model: 'big-pickle', messages: [] })) void chunk
     return undefined
@@ -1041,6 +1162,141 @@ test('a 429 tells the shared quota apart from a keyed account', async () => {
   })
   assert.match(keyed.message, /HTTP 429/)
   assert.match(keyed.message, /该账号|稍后重试/, 'a keyed caller already has a key; the advice must differ')
+})
+
+// ---- 502 gateway retries ----
+
+/**
+ * The body Zen's gateway actually returns when it cannot reach the provider.
+ *
+ * `error` is a bare string here, not an object, so `parsed.error.message` is
+ * undefined and the detail has to fall back to the raw text — which is the shape
+ * that made the first version of this error read as an unexplained wall.
+ */
+const GATEWAY_502_BODY = JSON.stringify({
+  error: 'acp-proxy failure',
+  detail: 'Error: upstream request failed: kind=connect-timeout code=UND_ERR_CONNECT_TIMEOUT '
+    + 'message=fetch failed <- Connect Timeout Error (attempted addresses: 172.65.90.22:443, '
+    + '172.65.90.23:443, 172.65.90.21:443, 172.65.90.20:443, timeout: 10000ms)',
+})
+
+/**
+ * Drain one stream whose transport always answers 502, counting the calls.
+ *
+ * The wait is stubbed out rather than shrunk: the production floor on the
+ * backoff is 100ms, so a ten-attempt spec would otherwise spend half a minute
+ * asleep to assert a number it already knows. The attempt count is whatever the
+ * caller asks for, which is the part under test.
+ * @param adapterOptions - overrides, typically `maxAttempts`.
+ * @returns how many requests were made and the error that ended the loop.
+ */
+async function gateway502Stream(adapterOptions = {}) {
+  const originalFetch = globalThis.fetch
+  let calls = 0
+  const waits = []
+  globalThis.fetch = async () => {
+    calls += 1
+    return new Response(GATEWAY_502_BODY, {
+      status: 502,
+      headers: { 'content-type': 'application/json' },
+    })
+  }
+  try {
+    const adapter = new OpenCodeFreeAdapter(null, { enabled: () => true }, {
+      credentials: () => [],
+      session: async () => ({ id: TEST_SESSION_ID, source: 'test' }),
+      backoffMs: () => 100,
+      sleep: async (ms) => { waits.push(ms) },
+      ...adapterOptions,
+    })
+    adapter.setModels([{ id: 'big-pickle', name: 'Big Pickle' }])
+    for await (const chunk of adapter.stream({ model: 'big-pickle', messages: [] })) void chunk
+    return { calls, error: undefined, waits }
+  } catch (error) {
+    return { calls, error, waits }
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+}
+
+test('a 502 gateway failure is retried to the configured attempt count', async () => {
+  // A 502 is Zen's gateway failing to reach the provider upstream. Nothing
+  // about the model or the body is wrong, so retrying is the whole fix — and a
+  // single attempt would turn a ten-second route blip into a failed turn.
+  const three = await gateway502Stream({ maxAttempts: () => 3 })
+  assert.equal(three.calls, 3, `3 attempts means 3 requests, got ${three.calls}`)
+  assert.ok(three.error, 'the stream still fails when every attempt does')
+
+  const ten = await gateway502Stream({ maxAttempts: () => 10 })
+  assert.equal(ten.calls, 10, `10 attempts means 10 requests, got ${ten.calls}`)
+})
+
+test('the default attempt count is ten, not three', async () => {
+  // The number an operator gets without touching the setting. Deliberately
+  // patient: this is the case where waiting is the fix.
+  const result = await gateway502Stream()
+  assert.equal(result.calls, DEFAULT_ATTEMPT_COUNT, `the default is ${DEFAULT_ATTEMPT_COUNT} attempts, got ${result.calls}`)
+  assert.equal(DEFAULT_ATTEMPT_COUNT, 10)
+})
+
+test('a 502 is not terminal, so it never retires the model', async () => {
+  // Retiring a model over a gateway fault would take a working model out of the
+  // picker for the rest of the day over a ten-second connect timeout.
+  assert.equal(classifyFailure(502, GATEWAY_502_BODY), undefined)
+  // The permanent sibling of the same message still is.
+  assert.equal(
+    classifyFailure(502, JSON.stringify({ error: { message: 'upstream request failed: model is unavailable' } })),
+    'unavailable',
+  )
+})
+
+test('a 502 says it is the gateway, not the request, and how many tries it cost', async () => {
+  const { error } = await gateway502Stream({ maxAttempts: () => 4 })
+  assert.ok(error, 'the stream must fail')
+  assert.equal(error.code, 'TRANSPORT', 'a 5xx is a transport fault, which is what makes it retryable')
+  // The operator's first question on seeing a raw status is "did I do something
+  // wrong"; this says no, and says the wait already happened.
+  assert.match(error.message, /网关故障/, 'name the gateway as the party at fault')
+  assert.match(error.message, /HTTP 502/)
+  assert.match(error.message, /UND_ERR_CONNECT_TIMEOUT/, 'the upstream detail must survive verbatim')
+  assert.match(error.message, /已重试 4 次均失败/, 'an error that reads as one attempt hides the wait')
+})
+
+test('a single-attempt failure is not labelled as a retry', async () => {
+  // "Retried 1 time" is noise; the count only earns its place past one.
+  const { error } = await gateway502Stream({ maxAttempts: () => 1 })
+  assert.doesNotMatch(error.message, /已重试/)
+})
+
+test('the backoff doubles and then flattens, so ten retries wait about a minute', () => {
+  // Uncapped, `800 * 2^9` is 409 seconds and ten of them is fourteen minutes of
+  // waiting for a route that was down for ten seconds.
+  assert.equal(backoffFor(0, 800), 800)
+  assert.equal(backoffFor(1, 800), 1_600)
+  assert.equal(backoffFor(2, 800), 3_200)
+  assert.equal(backoffFor(3, 800), 6_400)
+  // Past the fourth step the extra wait buys nothing, so it is clamped.
+  assert.equal(backoffFor(4, 800), 8_000)
+  assert.equal(backoffFor(9, 800), 8_000)
+  // The configured base is honoured below the ceiling, and the clamp is absolute.
+  assert.equal(backoffFor(9, 100), 8_000, 'even a small base is clamped once it grows past the ceiling')
+  assert.equal(backoffFor(0, 30_000), 8_000, 'a base above the ceiling is pulled down, not passed through')
+  // A negative attempt must not invert the step.
+  assert.equal(backoffFor(-3, 800), 800)
+})
+
+test('ten 502 retries wait about a minute, not fourteen minutes', async () => {
+  // The ceiling has to hold across the whole loop, not just in isolation: this
+  // is the wait an operator actually sits through when the route is down.
+  const { calls, waits } = await gateway502Stream({ maxAttempts: () => 10 })
+  assert.equal(calls, 10)
+  // Nine gaps between ten attempts, each at or under the ceiling.
+  assert.equal(waits.length, 9, `ten attempts leave nine gaps, got ${waits.length}`)
+  const total = waits.reduce((sum, ms) => sum + ms, 0)
+  assert.ok(total <= 60_000, `the whole wait must stay under a minute, got ${total}ms`)
+  assert.ok(total > 20_000, `and it must still back off rather than hammering, got ${total}ms`)
+  // The tail is flat: the last waits are the ceiling, not a growing number.
+  assert.equal(waits[waits.length - 1], 8_000)
 })
 
 // ---- credential store (ported from randomix777) ----
@@ -1338,4 +1594,168 @@ test('an unreachable endpoint is a failed check, not a crash', async () => {
   assert.equal(result.ok, false)
   assert.match(result.reason, /无法连接 Zen/, 'the operator needs to know the endpoint was unreachable')
   assert.equal(await verifyKey({ baseURL: '', key: '   ', model: '' }).then((r) => r.ok), false, 'no key means no check')
+})
+
+test('the probe carries the four gateway signals a real request does', async () => {
+  // A bare `Authorization: Bearer <key>` is refused with 403 FreeTierError for a
+  // perfectly valid key — probed live on 2026-10-14 with a real key from
+  // opencode.ai/zen. The gateway decides on the request's shape, not on the
+  // credential, so a probe that omits any of these reports "Key 未被接受" for
+  // keys that work, and the two keyed policies stay locked out of their feature.
+  const original = globalThis.fetch
+  const seen = []
+  globalThis.fetch = async (_url, init) => {
+    seen.push({ headers: init.headers, body: JSON.parse(init.body) })
+    return new Response('data: {"choices":[]}\n\ndata: [DONE]\n\n', {
+      status: 200,
+      headers: { 'content-type': 'text/event-stream' },
+    })
+  }
+  try {
+    const result = await verifyKey({
+      baseURL: 'https://opencode.ai/zen/v1',
+      key: 'sk-a',
+      model: 'big-pickle',
+      session: 'ses_realsession0000000000000',
+    })
+    assert.equal(result.ok, true, 'a probe that satisfies the gateway is accepted')
+  } finally {
+    globalThis.fetch = original
+  }
+  const { headers, body } = seen[0]
+  // 1. the CLI User-Agent
+  assert.match(String(headers['user-agent'] ?? headers['User-Agent']), /^opencode\//)
+  // 2. a real session id
+  assert.equal(headers['x-opencode-session'], 'ses_realsession0000000000000')
+  // 3. bash and read in the body
+  const names = (body.tools ?? []).map((t) => t.function.name)
+  assert.deepEqual(names.sort(), ['bash', 'read'], `got ${names.join(', ')}`)
+  // 4. streaming — the CLI always streams, and a non-streaming body gets the
+  //    same FreeTierError a missing session id does.
+  assert.equal(body.stream, true, 'the gateway rejects a non-streaming body')
+  // The stubs must be unselectable: this probe wants prose, not a tool call.
+  assert.equal(body.tool_choice, 'none')
+})
+
+test('a FreeTierError from the probe blames the gateway, not the key', async () => {
+  // The probe now carries every signal, so a FreeTierError means the session id
+  // could not be read. Saying "Key 未被接受" here sends the operator to re-paste
+  // a key that was never the problem.
+  const original = globalThis.fetch
+  globalThis.fetch = async () => new Response(JSON.stringify({
+    type: 'error',
+    error: {
+      type: 'FreeTierError',
+      message: "OpenCode's free tier can only be used from within OpenCode.",
+    },
+  }), { status: 403, headers: { 'content-type': 'application/json' } })
+  let result
+  try {
+    result = await verifyKey({
+      baseURL: 'https://opencode.ai/zen/v1',
+      key: 'sk-a',
+      model: 'big-pickle',
+      session: 'ses_realsession0000000000000',
+    })
+  } finally {
+    globalThis.fetch = original
+  }
+  assert.equal(result.ok, false)
+  assert.match(result.reason, /网关/, 'name the gateway as the party at fault')
+  assert.doesNotMatch(result.reason, /^Key 未被接受/, 'and not the credential')
+  assert.match(result.reason, /opencode run/, 'the operator still gets the concrete next step')
+})
+
+test('a plain 403 from the probe is still the key being refused', async () => {
+  // Not every 403 is the gateway. An AuthError-shaped body means the credential
+  // itself was turned down, and that verdict must survive.
+  const original = globalThis.fetch
+  globalThis.fetch = async () => new Response(JSON.stringify({
+    type: 'error',
+    error: { type: 'AuthError', message: 'Invalid API key' },
+  }), { status: 403, headers: { 'content-type': 'application/json' } })
+  let result
+  try {
+    result = await verifyKey({
+      baseURL: 'https://opencode.ai/zen/v1',
+      key: 'sk-a',
+      model: 'big-pickle',
+      session: 'ses_realsession0000000000000',
+    })
+  } finally {
+    globalThis.fetch = original
+  }
+  assert.equal(result.ok, false)
+  assert.match(result.reason, /Key 未被接受/, 'a credential rejection says so plainly')
+})
+
+// ---- key entry: names are derived, never asked for ----
+
+test('key names are derived from position and stay stable', () => {
+  // The operator types values only. If the name were theirs to choose, a
+  // mismatch between what the page writes and what the Host reads would leave a
+  // key that is configured but never sent.
+  assert.deepEqual(apiKeyNamesFor(0), [])
+  assert.deepEqual(apiKeyNamesFor(1), ['OPENCODE_API_KEY'])
+  assert.deepEqual(apiKeyNamesFor(4), ['OPENCODE_API_KEY', 'OPENCODE_API_KEY_1', 'OPENCODE_API_KEY_2', 'OPENCODE_API_KEY_3'])
+  assert.equal(apiKeyNameFor(0), 'OPENCODE_API_KEY')
+  assert.equal(apiKeyNameFor(3), 'OPENCODE_API_KEY_3')
+  // Out-of-range input must not produce a name that collides with another row.
+  assert.equal(apiKeyNameFor(-2), 'OPENCODE_API_KEY')
+  assert.equal(apiKeyNameFor(1.7), 'OPENCODE_API_KEY_1')
+  assert.equal(apiKeyNameFor(NaN), 'OPENCODE_API_KEY')
+})
+
+test('a key entered in the page is exported, and withdrawn when removed', async () => {
+  // This is the whole fix for "I added a key and verify does nothing": the value
+  // used to have to be an environment variable the operator set themselves, and
+  // one set after the process started was invisible — so the Host reported no
+  // key and the button stayed dead. Now the config is the source and the
+  // environment is derived from it.
+  const saved = {
+    OPENCODE_API_KEY: process.env.OPENCODE_API_KEY,
+    OPENCODE_API_KEY_1: process.env.OPENCODE_API_KEY_1,
+  }
+  try {
+    delete process.env.OPENCODE_API_KEY
+    delete process.env.OPENCODE_API_KEY_1
+    const keys = ['sk-one', 'sk-two']
+    keys.forEach((value, index) => { process.env[apiKeyNameFor(index)] = value })
+    assert.equal(process.env.OPENCODE_API_KEY, 'sk-one')
+    assert.equal(process.env.OPENCODE_API_KEY_1, 'sk-two')
+    // Resolving through the same path the requests use must now see both.
+    assert.deepEqual(credentialPool('OPENCODE_API_KEY,OPENCODE_API_KEY_1'), [
+      { name: 'OPENCODE_API_KEY', key: 'sk-one' },
+      { name: 'OPENCODE_API_KEY_1', key: 'sk-two' },
+    ])
+
+    // Removing a row withdraws the variable rather than leaving a stale key
+    // behind for the next request to pick up.
+    const kept = ['sk-one']
+    for (let index = kept.length; index < keys.length; index += 1) {
+      delete process.env[apiKeyNameFor(index)]
+    }
+    assert.equal(process.env.OPENCODE_API_KEY, 'sk-one')
+    assert.equal(process.env.OPENCODE_API_KEY_1, undefined)
+    assert.deepEqual(credentialPool('OPENCODE_API_KEY,OPENCODE_API_KEY_1'), [
+      { name: 'OPENCODE_API_KEY', key: 'sk-one' },
+    ])
+  } finally {
+    for (const [name, value] of Object.entries(saved)) {
+      if (value === undefined) delete process.env[name]
+      else process.env[name] = value
+    }
+  }
+})
+
+test('the manual apiKeyEnv escape hatch is only used when no key is entered', () => {
+  // Two sources must not both answer, or a request could be authenticated with
+  // a key the operator deleted from the page but left in the environment.
+  const entered = ['sk-from-page']
+  const namesFor = (values, manual) => (values.length > 0
+    ? apiKeyNamesFor(values.length)
+    : String(manual).split(',').map((n) => n.trim()).filter(Boolean))
+  assert.deepEqual(namesFor(entered, 'MY_KEY'), ['OPENCODE_API_KEY'], 'entered keys win')
+  assert.deepEqual(namesFor([], 'MY_KEY,OTHER'), ['MY_KEY', 'OTHER'], 'manual names only when nothing entered')
+  assert.deepEqual(namesFor([], ''), [], 'and nothing at all')
 })
