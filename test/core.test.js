@@ -5,19 +5,30 @@ import { unlinkSync, writeFileSync } from 'node:fs'
 import { test } from 'node:test'
 
 import {
+  QUOTA_POLICY,
   ZEN_ROUTE_ID,
   buildModelSet,
   buildProviderEntry,
   describeCatalog,
+  effectiveQuotaPolicy,
   formatTokens,
   resolveEntryNamespace,
   toYamlSnippet,
 } from '../lib/core.js'
 import { AssistantStreamAccumulator, LlmAdapter } from '@deepseek-ai/dsh-llm'
 import { ZEN_BASE_URL } from '../lib/core.js'
-import { OpenCodeFreeAdapter, auditWireMessages, sanitizeWireMessages } from '../lib/provider.js'
+import { OpenCodeFreeAdapter, auditWireMessages, buildHeaders, credentialSequence, sanitizeWireMessages } from '../lib/provider.js'
+import { keyCheckStillValid, keyFingerprint, verifyKey } from '../lib/keycheck.js'
 import { mergeCatalog, serveableModels } from '../lib/discovery.js'
-import { credentialPool, credentialValue, estimateResetMs, resolveCredential, resolveCredentialPool } from '../lib/quota.js'
+import {
+  DEFAULT_REFUSAL_COOLDOWN_MS,
+  QuotaTracker,
+  credentialPool,
+  credentialValue,
+  estimateResetMs,
+  resolveCredential,
+  resolveCredentialPool,
+} from '../lib/quota.js'
 import { AvailabilityTracker, classifyFailure } from '../lib/availability.js'
 import { gateToolDefinitions } from '../lib/gate-tools.js'
 
@@ -326,7 +337,12 @@ test('stream honours the configured Zen root instead of the compiled-in one', ()
 })
 
 /** Run one stream against a swappable transport and capture what went on the wire. */
+// A shape-correct id standing in for one OpenCode really created. Injected by
+// default so these specs never depend on the CLI database being present.
+const TEST_SESSION_ID = 'ses_ab12cd34ef56gh78ij90kl12mn'
+
 async function captureStream(adapterOptions, options, models = [{ id: 'big-pickle', name: 'Big Pickle', maxTokens: 32000 }]) {
+  const hooks = { session: async () => ({ id: TEST_SESSION_ID, source: 'test' }), ...adapterOptions }
   const calls = []
   const originalFetch = globalThis.fetch
   globalThis.fetch = async (url, init) => {
@@ -335,7 +351,7 @@ async function captureStream(adapterOptions, options, models = [{ id: 'big-pickl
     return new Response(sse, { status: 200, headers: { 'content-type': 'text/event-stream' } })
   }
   try {
-    const adapter = new OpenCodeFreeAdapter(null, { enabled: () => true }, adapterOptions)
+    const adapter = new OpenCodeFreeAdapter(null, { enabled: () => true }, hooks)
     adapter.setModels(models)
     const chunks = []
     for await (const chunk of adapter.stream({ model: 'big-pickle', messages: [], ...options })) chunks.push(chunk)
@@ -350,8 +366,13 @@ test('an anonymous request carries all three Zen free-tier gate markers', async 
   const [call] = await captureStream({ credentials: () => [] }, { sessionId: 'conversation-42' })
   assert.equal(call.headers.Authorization, 'Bearer public')
 
-  // 1. the User-Agent must read as the OpenCode CLI
-  assert.ok(String(call.headers['User-Agent']).startsWith('opencode/'), 'User-Agent must start with opencode/')
+  // 1. the User-Agent must read as the OpenCode CLI.
+  // Spelled lowercase on purpose: `attributionHeaders()` supplies `user-agent`
+  // (deepseek-harness/…), and an override under a differently-cased key would
+  // sit beside it instead of replacing it — the harness value then wins on the
+  // wire and Zen answers 403. This asserts the override actually took.
+  assert.ok(String(call.headers['user-agent']).startsWith('opencode/'), 'user-agent must start with opencode/')
+  assert.equal(call.headers['User-Agent'], undefined, 'a differently-cased duplicate must not survive beside it')
   // 2. a canonical session id: ses_ + 12 lowercase hex + 14 Base62
   assert.match(call.headers['x-opencode-session'], /^ses_[0-9a-f]{12}[0-9a-zA-Z]{14}$/)
   assert.equal(call.headers['x-opencode-session'].length, 4 + 26)
@@ -361,27 +382,305 @@ test('an anonymous request carries all three Zen free-tier gate markers', async 
   assert.equal(call.body.tool_choice, 'none', 'stub tools must never be selectable')
 })
 
+// Which lane a request uses is the operator's policy now, and the default
+// (`publicOnly`) never touches a key at all. Specs that exercise the paid lane
+// therefore have to ask for it — explicitly, and with a key that has been
+// verified, because an unverified one does not unlock it.
+const PAID_FIRST = {
+  quotaPolicy: () => QUOTA_POLICY.PREFER_KEY,
+  keyVerified: () => true,
+}
+/** The public lane leads, and a key waits behind it. */
+const PUBLIC_FIRST = {
+  quotaPolicy: () => QUOTA_POLICY.PREFER_PUBLIC,
+  keyVerified: () => true,
+}
+const IDLE_QUOTA = { record: () => {}, refuse: () => {}, clear: () => {}, publicLaneClosed: () => false }
+
+test('a keyed request keeps the harness attribution instead of the CLI User-Agent', async () => {
+  const [call] = await captureStream({
+    credentials: () => [{ key: 'sk-test', source: 'env' }],
+    ...PAID_FIRST,
+  })
+  // The paid lane must not borrow the CLI identity; attribution stays intact.
+  assert.ok(String(call.headers['user-agent']).startsWith('deepseek-harness/'), `got ${call.headers['user-agent']}`)
+  assert.equal(call.headers['x-opencode-session'], undefined)
+})
+
+/**
+ * Drive one request that every attempt rejects, and report what it spent.
+ *
+ * The `bearers` it returns are the point: they say which lane each attempt
+ * actually used, which is the only way to assert that a configured key stays
+ * untouched until the free lane has said no.
+ * @param credentials - the operator's key pool, as the Host would resolve it.
+ * @param options - `status`, `body` and `headers` for every rejection, plus
+ * `quota` to hand the adapter a lane that is already known to be closed.
+ * @returns `{ calls, bearers, error }`.
+ */
+async function captureRejection(credentials, options = {}) {
+  const status = options.status ?? 401
+  const body = options.body ?? JSON.stringify({ error: { message: 'Unauthorized', type: 'AuthError' } })
+  const originalFetch = globalThis.fetch
+  const bearers = []
+  globalThis.fetch = async (_url, init) => {
+    bearers.push(String(init?.headers?.Authorization ?? ''))
+    return new Response(body, {
+      status,
+      headers: { 'content-type': 'application/json', ...(options.headers ?? {}) },
+    })
+  }
+  let error
+  try {
+    const adapter = new OpenCodeFreeAdapter(null, { enabled: () => true }, {
+      credentials: () => credentials,
+      session: async () => ({ id: TEST_SESSION_ID, source: 'test' }),
+      ...(options.quota === undefined ? {} : { quota: options.quota }),
+      ...(options.policy === undefined ? {} : { ...options.policy }),
+    })
+    adapter.setModels([{ id: 'big-pickle', name: 'Big Pickle', maxTokens: 32000 }])
+    for await (const chunk of adapter.stream({ model: 'big-pickle', messages: [] })) void chunk
+  } catch (caught) {
+    error = caught
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+  return { calls: bearers.length, bearers, error }
+}
+
+const FREE_TIER_BODY = JSON.stringify({
+  error: { message: "OpenCode's free tier can only be used from within OpenCode.", type: 'FreeTierError' },
+})
+const RATE_LIMIT_BODY = JSON.stringify({ error: { message: 'Rate limit exceeded', type: 'RateLimitError' } })
+
+const TWO_KEYS = [{ name: 'key A', key: 'sk-a' }, { name: 'key B', key: 'sk-b' }]
+
+test('the default policy spends the public quota and nothing else', async () => {
+  // This is the rule that keeps the plugin free: a key sitting in the
+  // environment is not, by itself, permission to bill it.
+  const result = await captureRejection(TWO_KEYS, { status: 429, body: RATE_LIMIT_BODY })
+  assert.deepEqual(
+    result.bearers.filter((b) => b !== 'Bearer public'),
+    [],
+    `no key may be spent under the default policy, got ${result.bearers.join(', ')}`,
+  )
+  const refusal = await captureRejection(TWO_KEYS, { status: 403, body: FREE_TIER_BODY })
+  assert.deepEqual(
+    refusal.bearers.filter((b) => b !== 'Bearer public'),
+    [],
+    `a free-tier refusal must not reach a key either, got ${refusal.bearers.join(', ')}`,
+  )
+})
+
+test('a configured but unverified key does not unlock a keyed policy', async () => {
+  // The gate is the point: a mistyped credential would otherwise flip every
+  // request onto a lane that then fails, and the failure would look like an
+  // outage rather than a typo.
+  for (const policy of [QUOTA_POLICY.PREFER_PUBLIC, QUOTA_POLICY.PREFER_KEY]) {
+    const result = await captureRejection(TWO_KEYS, {
+      status: 403,
+      body: FREE_TIER_BODY,
+      policy: { quotaPolicy: () => policy, keyVerified: () => false },
+    })
+    assert.deepEqual(result.bearers, ['Bearer public'], `${policy} without a verified key: ${result.bearers.join(', ')}`)
+  }
+})
+
+test('effectiveQuotaPolicy gates the keyed rules on a verified key', () => {
+  // The page disables the two keyed rules; this is the Host refusing to honour
+  // them, which is the half that actually protects the operator's quota when
+  // the page is stale, read-only, or bypassed.
+  assert.equal(effectiveQuotaPolicy(QUOTA_POLICY.PUBLIC_ONLY, false), QUOTA_POLICY.PUBLIC_ONLY)
+  assert.equal(effectiveQuotaPolicy(QUOTA_POLICY.PUBLIC_ONLY, true), QUOTA_POLICY.PUBLIC_ONLY)
+  assert.equal(effectiveQuotaPolicy(QUOTA_POLICY.PREFER_PUBLIC, true), QUOTA_POLICY.PREFER_PUBLIC)
+  assert.equal(effectiveQuotaPolicy(QUOTA_POLICY.PREFER_KEY, true), QUOTA_POLICY.PREFER_KEY)
+  assert.equal(effectiveQuotaPolicy(QUOTA_POLICY.PREFER_PUBLIC, false), QUOTA_POLICY.PUBLIC_ONLY)
+  assert.equal(effectiveQuotaPolicy(QUOTA_POLICY.PREFER_KEY, false), QUOTA_POLICY.PUBLIC_ONLY)
+  // An unknown or missing value must degrade to the safe lane, never to a keyed one.
+  assert.equal(effectiveQuotaPolicy('nonsense', true), QUOTA_POLICY.PUBLIC_ONLY)
+  assert.equal(effectiveQuotaPolicy(undefined, true), QUOTA_POLICY.PUBLIC_ONLY)
+})
+
+test('a key-first policy spends the key and falls back to the public lane', async () => {
+  const result = await captureRejection([{ name: 'key A', key: 'sk-a' }], {
+    status: 401,
+    policy: PAID_FIRST,
+  })
+  assert.deepEqual(result.bearers, ['Bearer sk-a', 'Bearer public'], `got ${result.bearers.join(', ')}`)
+})
+
+test('a rejection the free lane cannot hand off is not retried and spends no key', async () => {
+  // The rejection used to be `throw`n from inside the attempt's try, which the
+  // same-level catch caught — so "do not retry" silently became "retry". And a
+  // key is a fallback, not a spare: an unrelated 401 would fail identically on
+  // the paid route, so spending the operator's quota on it buys the same error
+  // at a price.
+  const anonymous = await captureRejection([])
+  assert.ok(anonymous.error, 'the stream must fail')
+  assert.equal(anonymous.calls, 1, `one credential, one rejection, one request — got ${anonymous.calls}`)
+
+  const pooled = await captureRejection(TWO_KEYS, { policy: PUBLIC_FIRST })
+  assert.ok(pooled.error, 'the stream must fail')
+  assert.deepEqual(pooled.bearers, ['Bearer public'], `the keys must stay unspent, got ${pooled.bearers.join(', ')}`)
+})
+
+test('an exhausted public quota is what unlocks a configured key', async () => {
+  const first = await captureRejection([{ name: 'key A', key: 'sk-a' }], {
+    status: 429,
+    body: RATE_LIMIT_BODY,
+    policy: PUBLIC_FIRST,
+  })
+  assert.equal(first.bearers[0], 'Bearer public', 'the free lane is always asked first')
+  assert.equal(first.bearers[1], 'Bearer sk-a', 'and the key is spent only once it has said no')
+  assert.ok(first.error, 'both failing still fails the request')
+  assert.match(first.error.message, /key A/, 'the key verdict is the one worth reporting')
+})
+
+test('a free-tier refusal is what unlocks a configured key', async () => {
+  const result = await captureRejection([{ name: 'key A', key: 'sk-a' }], {
+    status: 403,
+    body: FREE_TIER_BODY,
+    policy: PUBLIC_FIRST,
+  })
+  assert.deepEqual(result.bearers, ['Bearer public', 'Bearer sk-a'], `got ${result.bearers.join(', ')}`)
+  assert.ok(result.error)
+})
+
+test('a lane already known to be closed is not probed again', async () => {
+  // "Public first" means first when it can answer. Re-asking a lane that
+  // refused moments ago adds a doomed round trip to every turn.
+  const closed = await captureRejection([{ name: 'key A', key: 'sk-a' }], {
+    status: 403,
+    body: FREE_TIER_BODY,
+    policy: PUBLIC_FIRST,
+    quota: { ...IDLE_QUOTA, publicLaneClosed: () => true },
+  })
+  assert.deepEqual(closed.bearers, ['Bearer sk-a'], `got ${closed.bearers.join(', ')}`)
+})
+
+test('a refusal is remembered so the next request starts at the keys', async () => {
+  // The tracker is what carries the memory between requests; without it the
+  // free lane would be re-probed on every single call.
+  const tracker = new QuotaTracker(join(tmpdir(), `ocf-quota-${Date.now()}.json`))
+  const now = Date.now()
+  assert.equal(tracker.publicLaneClosed(now), false, 'nothing known means open')
+  tracker.refuse(now)
+  assert.equal(tracker.publicLaneClosed(now), true, 'a refusal closes it')
+  assert.equal(tracker.publicLaneClosed(now + DEFAULT_REFUSAL_COOLDOWN_MS), false, 'and it reopens')
+})
+
+/** Case-insensitive header read, the way the wire would resolve it. */
+function header(headers, name) {
+  const key = Object.keys(headers).find((k) => k.toLowerCase() === name.toLowerCase())
+  return key === undefined ? undefined : headers[key]
+}
+
+test('the CLI disguise wins however the host spells its attribution header', () => {
+  // The bug this replaces was a spelling accident, not a logic error: the code
+  // said "send opencode/…" and the wire said "deepseek-harness/…" because two
+  // casings of one header coexisted. Asserting the happy path alone would not
+  // have caught it, so the hostile inputs are the test.
+  const hostile = [
+    { 'User-Agent': 'deepseek-harness/9.9.9 (+https://example.test)' },
+    { 'user-agent': 'deepseek-harness/9.9.9 (+https://example.test)' },
+    { 'USER-AGENT': 'deepseek-harness/9.9.9', 'x-dsh-deployment': 'acme' },
+  ]
+  for (const attribution of hostile) {
+    const headers = buildHeaders(
+      { key: 'public', anonymous: true },
+      { userAgent: 'opencode/1.18.18 ai-sdk/provider-utils/4.0.23', session: TEST_SESSION_ID },
+      attribution,
+    )
+    const spellings = Object.keys(headers).filter((k) => k.toLowerCase() === 'user-agent')
+    assert.equal(spellings.length, 1, `exactly one user-agent, got ${spellings.join(' + ')}`)
+    assert.ok(String(header(headers, 'user-agent')).startsWith('opencode/'), `got ${header(headers, 'user-agent')}`)
+  }
+  // A keyed attempt keeps whatever the host declared, disguise or not — and
+  // keeps it even when the host spells the name in a different case.
+  const keyed = buildHeaders(
+    { key: 'sk-test', anonymous: false },
+    { userAgent: undefined, session: undefined },
+    { 'User-Agent': 'deepseek-harness/1.2.3 (+https://example.test)' },
+  )
+  assert.ok(String(header(keyed, 'user-agent')).startsWith('deepseek-harness/'), `got ${header(keyed, 'user-agent')}`)
+  assert.equal(keyed['x-opencode-session'], undefined)
+})
+
+test('only the anonymous lane warns the model off the placeholders', async () => {
+  // The warning names tools, so it may only be sent on the lane that actually
+  // puts them on the wire. On the paid lane none are advertised, and telling a
+  // model to avoid tools it was never offered is noise it may obey.
+  const tools = [{ name: 'grep', description: 'search', parameters: { type: 'object', properties: {} } }]
+  const [anonymous] = await captureStream({ credentials: () => [] }, { tools })
+  const [keyed] = await captureStream({
+    credentials: () => [{ key: 'sk-test', source: 'env' }],
+    ...PAID_FIRST,
+  }, { tools })
+  const warned = (call) => JSON.stringify(call.body.messages).includes('Do not call the tools named')
+  assert.ok(warned(anonymous), 'the anonymous lane carries the placeholder warning')
+  assert.equal(warned(keyed), false, 'the paid lane must not warn about tools it never sent')
+})
+
 test('a keyed request advertises no placeholder tools', async () => {
   // Probed: a keyed body carrying no stubs answers 401 AuthError, never 403
   // FreeTierError — the free-tier gate does not run on the authenticated route.
   // Advertising placeholders there would give a paying caller a tool the model
   // can select but nobody can execute.
   const tools = [{ name: 'grep', description: 'search', parameters: { type: 'object', properties: {} } }]
-  const [call] = await captureStream({ credentials: () => [{ key: 'sk-test', source: 'env' }] }, { tools })
+  const [call] = await captureStream({
+    credentials: () => [{ key: 'sk-test', source: 'env' }],
+    ...PAID_FIRST,
+  }, { tools })
   const names = call.body.tools.map((t) => t.function.name)
   assert.deepEqual(names, ['grep'], `a keyed attempt must not carry gate stubs, got ${names.join(', ')}`)
 })
 
-test('the session id is stable per conversation so upstream prompt caching holds', async () => {
+test('the session id is stable across calls so upstream prompt caching holds', async () => {
   const [first] = await captureStream({ credentials: () => [] }, { sessionId: 'conversation-42' })
   const [again] = await captureStream({ credentials: () => [] }, { sessionId: 'conversation-42' })
   const [other] = await captureStream({ credentials: () => [] }, { sessionId: 'conversation-99' })
+  // One id per HOST now, not one per DSH conversation: since 2026-10-13 Zen's
+  // gate proves the id against sessions OpenCode really created, and there is
+  // one pool to borrow from. Stability — which is what prompt-cache affinity
+  // actually needs — still holds; per-conversation uniqueness does not, and
+  // cannot, so this no longer asserts what it used to.
   assert.equal(first.headers['x-opencode-session'], again.headers['x-opencode-session'])
-  assert.notEqual(first.headers['x-opencode-session'], other.headers['x-opencode-session'])
+  assert.equal(first.headers['x-opencode-session'], other.headers['x-opencode-session'])
+  assert.match(first.headers['x-opencode-session'], /^ses_[A-Za-z0-9]{26}$/, 'still a canonical OpenCode id')
+})
+
+test('a host with no real session fails loudly instead of forging one', async () => {
+  // Forging a shape-correct id is exactly what produced a wall of 403
+  // FreeTierErrors until 2026-10-13, so it must not survive as a fallback.
+  const originalFetch = globalThis.fetch
+  globalThis.fetch = async () => new Response(
+    'data: {"choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n',
+    { status: 200, headers: { 'content-type': 'text/event-stream' } },
+  )
+  let error
+  try {
+    const adapter = new OpenCodeFreeAdapter(null, { enabled: () => true }, {
+      credentials: () => [],
+      session: async () => ({ id: undefined, reason: '本机没有 OpenCode 会话库（/x/opencode.db）' }),
+    })
+    adapter.setModels([{ id: 'big-pickle', name: 'Big Pickle', maxTokens: 32000 }])
+    for await (const chunk of adapter.stream({ model: 'big-pickle', messages: [] })) void chunk
+  } catch (caught) {
+    error = caught
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+  assert.ok(error, 'the stream must fail rather than send a fabricated id')
+  assert.equal(error.code, 'NO_OPENCODE_SESSION')
+  assert.match(error.message, /opencode run/, 'the operator needs the concrete next step')
+  assert.match(error.message, /OPENCODE_API_KEY/, 'and the keyed escape hatch')
 })
 
 test('a keyed request keeps the harness identity and no CLI disguise', async () => {
-  const [call] = await captureStream({ credentials: () => [{ key: 'sk-test', source: 'env' }] }, { sessionId: 'c1' })
+  const [call] = await captureStream({
+    credentials: () => [{ key: 'sk-test', source: 'env' }],
+    ...PAID_FIRST,
+  }, { sessionId: 'c1' })
   assert.equal(call.headers.Authorization, 'Bearer sk-test')
   assert.equal(call.headers['User-Agent'], undefined, 'a paid lane must not borrow the CLI User-Agent')
   assert.equal(call.headers['x-opencode-session'], undefined, 'a paid lane needs no forged session')
@@ -711,6 +1010,23 @@ test('a rejected credential says which credential was at fault and what to do', 
   assert.match(error.message, /opencode\.ai\/zen/, 'the operator needs the next step, not just a status')
 })
 
+test('a FreeTierError is reported as a closed free lane, not as bad credentials', async () => {
+  // The shape Zen actually returns today (2026-10-13, probed live).
+  const body = JSON.stringify({
+    type: 'error',
+    error: {
+      type: 'FreeTierError',
+      message: "OpenCode's free tier can only be used from within OpenCode. Download it at https://opencode.ai and keep building.",
+    },
+  })
+  const error = await failingStream(403, body, { credentials: () => [], maxAttempts: () => 1 })
+  assert.ok(error, 'the stream must fail')
+  assert.match(error.message, /HTTP 403 FreeTierError/, 'name the upstream error class')
+  // A user with no key configured must not be sent hunting through credentials.
+  assert.doesNotMatch(error.message, /拒绝了本次凭据/)
+  assert.match(error.message, /OPENCODE_API_KEY/, 'the message must name the concrete next step')
+})
+
 test('a 429 tells the shared quota apart from a keyed account', async () => {
   const body = JSON.stringify({ error: { message: 'Rate limit exceeded' } })
   const options = { maxAttempts: () => 1, backoffMs: () => 100 }
@@ -718,7 +1034,11 @@ test('a 429 tells the shared quota apart from a keyed account', async () => {
   assert.match(anonymous.message, /HTTP 429/)
   assert.match(anonymous.message, /公共免费额度/)
   assert.match(anonymous.message, /OPENCODE_API_KEY|密钥环境变量/, 'the fix for an anonymous caller is a key')
-  const keyed = await failingStream(429, body, { credentials: () => [{ key: 'sk-test', source: 'env' }], ...options })
+  const keyed = await failingStream(429, body, {
+    credentials: () => [{ name: 'env', key: 'sk-test' }],
+    ...PAID_FIRST,
+    ...options,
+  })
   assert.match(keyed.message, /HTTP 429/)
   assert.match(keyed.message, /该账号|稍后重试/, 'a keyed caller already has a key; the advice must differ')
 })
@@ -909,4 +1229,113 @@ test('sanitize leaves a healthy tool history exactly as it is', () => {
   const warnings = []
   assert.deepEqual(sanitizeWireMessages(healthy, (l) => warnings.push(l)), healthy)
   assert.deepEqual(warnings, [])
+})
+
+// ---- usage rules & key verification ----
+
+test('credentialSequence follows the policy, not the presence of a key', async () => {
+  const keys = [{ name: 'key A', key: 'sk-a' }, { name: 'key B', key: 'sk-b' }]
+  const spent = (sequence) => sequence.map((entry) => entry.anonymous ? 'public' : `key:${entry.key}`)
+
+  const only = await credentialSequence(keys, 0, QUOTA_POLICY.PUBLIC_ONLY)
+  assert.deepEqual(spent(only), ['public'], 'the default policy must not carry a key at all')
+
+  const preferPublic = await credentialSequence(keys, 0, QUOTA_POLICY.PREFER_PUBLIC)
+  assert.deepEqual(spent(preferPublic), ['public', 'key:sk-a', 'key:sk-b'])
+
+  const preferKey = await credentialSequence(keys, 0, QUOTA_POLICY.PREFER_KEY)
+  assert.deepEqual(spent(preferKey), ['key:sk-a', 'key:sk-b', 'public'])
+
+  // Rotation only reorders the keys; the lane the policy picked still leads.
+  const rotated = await credentialSequence(keys, 1, QUOTA_POLICY.PREFER_PUBLIC)
+  assert.deepEqual(spent(rotated), ['public', 'key:sk-b', 'key:sk-a'])
+
+  // With nothing configured every policy collapses to the free lane — there is
+  // nothing else to prefer.
+  assert.deepEqual(spent(await credentialSequence([], 0, QUOTA_POLICY.PREFER_KEY)), ['public'])
+  assert.deepEqual(spent(await credentialSequence(undefined, 0, QUOTA_POLICY.PREFER_KEY)), ['public'])
+})
+
+test('a key verdict is about one key and expires with it', async () => {
+  // Persisted so a restart does not forget the answer — but tagged with a
+  // fingerprint of the key it describes, never the key itself.
+  const original = globalThis.fetch
+  const bodies = []
+  globalThis.fetch = async (_url, init) => {
+    bodies.push(JSON.parse(init.body))
+    return new Response(JSON.stringify({ error: { message: 'Invalid API key', type: 'AuthError' } }), {
+      status: 401,
+      headers: { 'content-type': 'application/json' },
+    })
+  }
+  let rejected
+  try {
+    rejected = await verifyKey({ baseURL: 'https://opencode.ai/zen/v1', key: 'sk-bad', model: 'big-pickle' })
+  } finally {
+    globalThis.fetch = original
+  }
+  assert.equal(rejected.ok, false, 'a rejected key must not be reported as working')
+  assert.match(rejected.reason, /401/, 'the reason names the status the operator has to act on')
+  assert.ok(!/^sk-/.test(String(bodies[0]?.model ?? '')), 'the probe sends a model id, never the key')
+
+  // A verdict about one key must not be reused for a different one.
+  assert.equal(keyCheckStillValid(rejected, 'sk-bad'), false, 'a failed check never unlocks anything')
+  assert.equal(
+    keyCheckStillValid({ ok: true, finger: keyFingerprint('sk-a') }, 'sk-a'),
+    true,
+    'a matching fingerprint is what makes a verdict reusable',
+  )
+  assert.equal(
+    keyCheckStillValid({ ok: true, finger: keyFingerprint('sk-a') }, 'sk-other'),
+    false,
+    'changing the key invalidates the verdict',
+  )
+  assert.equal(keyCheckStillValid({ ok: true }, 'sk-a'), false, 'no fingerprint means no proof')
+})
+
+test('a probe that gets past authentication proves the key even when the model does not answer', async () => {
+  // 400/429 happen *after* the key was accepted. Treating them as failure would
+  // lock a perfectly good key out of the rules it qualifies for, and the page
+  // would say "check failed" about a key that works.
+  const original = globalThis.fetch
+  for (const [status, ok] of [[400, true], [429, true], [500, true]]) {
+    globalThis.fetch = async () => new Response('{"error":{"message":"boom"}}', {
+      status,
+      headers: { 'content-type': 'application/json' },
+    })
+    let result
+    try {
+      result = await verifyKey({ baseURL: 'https://opencode.ai/zen/v1', key: 'sk-a', model: 'big-pickle' })
+    } finally {
+      globalThis.fetch = original
+    }
+    assert.equal(result.ok, ok, `HTTP ${status} after authentication must still count as ${ok}`)
+  }
+  for (const status of [401, 403]) {
+    globalThis.fetch = async () => new Response('{"error":{"message":"nope"}}', {
+      status,
+      headers: { 'content-type': 'application/json' },
+    })
+    let result
+    try {
+      result = await verifyKey({ baseURL: 'https://opencode.ai/zen/v1', key: 'sk-a', model: 'big-pickle' })
+    } finally {
+      globalThis.fetch = original
+    }
+    assert.equal(result.ok, false, `HTTP ${status} is the key being refused`)
+  }
+})
+
+test('an unreachable endpoint is a failed check, not a crash', async () => {
+  const original = globalThis.fetch
+  globalThis.fetch = async () => { throw new Error('connect ECONNREFUSED 127.0.0.1:1') }
+  let result
+  try {
+    result = await verifyKey({ baseURL: 'https://opencode.ai/zen/v1', key: 'sk-a', model: 'big-pickle' })
+  } finally {
+    globalThis.fetch = original
+  }
+  assert.equal(result.ok, false)
+  assert.match(result.reason, /无法连接 Zen/, 'the operator needs to know the endpoint was unreachable')
+  assert.equal(await verifyKey({ baseURL: '', key: '   ', model: '' }).then((r) => r.ok), false, 'no key means no check')
 })

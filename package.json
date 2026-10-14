@@ -1,6 +1,6 @@
 {
   "name": "dsh-connect-opencode-free",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "description": "OpenCode Zen 免费模型 —— 为 DSH 注入免 key 的 OpenCode Zen 免费档模型：设置页一键同步官方 free 模型、逐个启停、手动补模型，并可一键写入 llm-pi-ai provider 配置。",
   "type": "module",
   "main": "./lib/index.js",
@@ -32,7 +32,7 @@
   ],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/DragonHorizon-xtihc/dsh-connect-opencode-free.git"
+    "url": "https://github.com/DragonHorizon-xtihc/dsh-connect-opencode-free.git"
   },
   "homepage": "https://github.com/DragonHorizon-xtihc/dsh-connect-opencode-free#readme",
   "bugs": {
@@ -62,6 +62,6 @@
     "@deepseek-ai/schemastery": "*"
   },
   "devDependencies": {
-    "@deepseek-ai/dsh-llm": "^0.2.0-rc.2"
+    "@deepseek-ai/dsh-llm": "*"
   }
 }
