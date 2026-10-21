@@ -1,0 +1,44 @@
+# dsh-connect-opencode-free bundle layer.
+#
+# The row id is the settings namespace the browser page binds to
+# (lib/core.js: ENTRY_ID), and it must stay unique in the profile — the
+# settings service only exposes an entry id that appears exactly once.
+# Rows here compose over @deepseek-ai/dsh-base and can be overridden by the
+# user's profile cordis.patch.yml (later layers win per row id).
+- insert:
+    - id: dsh-connect-opencode-free
+      name: dsh-connect-opencode-free
+      config:
+        # Master switch. Off withdraws every free model from the picker.
+        enabled: true
+        # Discovery. Zen decides which model ids exist right now; models.dev
+        # decides which of them cost nothing and how large each one is. The
+        # catalog is their merge, so neither source has to be trusted alone.
+        zenBaseURL: 'https://opencode.ai/zen/v1'
+        catalogURL: 'https://models.dev/api.json'
+        autoSync: true
+        pollIntervalMs: 3600000
+        catalogTimeoutMs: 20000
+        # List the models.dev entries it has marked deprecated. Off keeps them
+        # out of both the settings page and the served set; on lists them with
+        # the badge and serves the ones Zen has not withdrawn as well.
+        includeDeprecated: false
+        # Credentials. Empty uses the public free quota; a comma-separated list
+        # of names is used round-robin, each read from the credential store
+        # first and the environment second.
+        apiKeyEnv: OPENCODE_API_KEY
+        maxRequestAttempts: 3
+        retryBackoffMs: 800
+        # Model shaping.
+        defaultContextWindow: 200000
+        disabledModels: []
+        manualModels: []
+        # Loopback port the settings page reads the discovered catalog from.
+        # Zen sends no CORS header, so the browser cannot fetch it itself.
+        bridgePort: 18766
+        # The Harness home resolves this; a profile links the bundle into a
+        # source checkout, so the install path is not a usable way to find it.
+        cacheDir: !!js dshHomePath('cache')
+        # Empty uses <cacheDir>/opencode-zen-catalog.json.
+        cachePath: ''
+        debug: false
