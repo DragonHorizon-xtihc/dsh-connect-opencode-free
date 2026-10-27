@@ -44,7 +44,7 @@
    ```json
    "dsh-connect-opencode-free": "link:D:/ClaudeCode/deepseek-harness/plugins/dsh-connect-opencode-free"
    ```
-   若要安装发布版，则写版本范围，例如 `"^0.2.0"`。
+   若要安装发布版，则写版本范围，例如 `"^0.4.1"`。
 4. 在该 profile 目录执行安装（会重新解析软链并应用 `cordis.patch.yml`）：
    ```sh
    pnpm install
