@@ -22,6 +22,7 @@ import { AssistantStreamAccumulator, LlmAdapter } from '@deepseek-ai/dsh-llm'
 import { ZEN_BASE_URL } from '../lib/core.js'
 import { OpenCodeFreeAdapter, DEFAULT_ATTEMPT_COUNT, auditWireMessages, backoffFor, buildHeaders, credentialSequence, isContextOverflow, sanitizeWireMessages } from '../lib/provider.js'
 import { keyCheckStillValid, keyFingerprint, verifyKey } from '../lib/keycheck.js'
+import { opencodeSystemPrompt, withOpencodePrompt } from '../lib/zen-prompt.js'
 import { mergeCatalog, serveableModels } from '../lib/discovery.js'
 import {
   DEFAULT_REFUSAL_COOLDOWN_MS,
@@ -429,6 +430,17 @@ async function captureStream(adapterOptions, options, models = [{ id: 'big-pickl
     globalThis.fetch = originalFetch
   }
   return calls
+}
+
+/**
+ * 请求体里的非 system 消息。
+ *
+ * 插件会往 system 里注入 OpenCode 官方提示词（lib/zen-prompt.js），于是
+ * 「消息序号 = 会话序号」不再成立。这些断言关心的是会话消息的形态与先后，
+ * 不是 system 落在第几条，所以统一把它排除。
+ */
+function wireOf(call) {
+  return call.body.messages.filter((m) => m.role !== 'system')
 }
 
 test('an anonymous request carries all three Zen free-tier gate markers', async () => {
@@ -1161,9 +1173,10 @@ test('a FreeTierError is reported as a closed free lane, not as bad credentials'
   assert.match(error.message, /OPENCODE_API_KEY/, 'the message must name the concrete next step')
 })
 
-test('a 429 reports an exhausted quota and when it reopens', async () => {
-  // 2026-10-18 定案：429 就是额度/速率限制（停手后同一会话、同一模型直连连打 8 次
-  // 全部 200）。所以文案要说额度，并给出重开时间。
+test('a 429 reports a closed free-tier window and when it reopens', async () => {
+  // 2026-10-27 修订：429 的拒绝发生在凭据校验之前（真 Key / 假 Key / 无凭据拿到同一个
+  // 429，retry-after 一致），所以带 Key 时**不能**说成「你这把 Key 的额度用完了」——
+  // 那会让人去查一个没问题的 Key。
   const body = JSON.stringify({ error: { message: 'Rate limit exceeded' } })
   const options = { maxAttempts: () => 1, backoffMs: () => 100 }
 
@@ -1180,7 +1193,24 @@ test('a 429 reports an exhausted quota and when it reopens', async () => {
   })
   assert.ok(keyed, '必须抛错')
   assert.match(keyed.message, /HTTP 429/)
-  assert.match(keyed.message, /该账号的免费额度已用尽/, '带 Key 时说的是这个账号的额度')
+  assert.match(keyed.message, /免费档窗口已关闭/, '带 Key 时说的是窗口，不是这把 Key 的额度')
+  assert.doesNotMatch(keyed.message, /该账号的免费额度已用尽/, '这个拒绝与所配的 Key 无关')
+})
+
+test('a 402 says the account has no funds, not that the key is bad', async () => {
+  // 实测（2026-10-27）：同一把 Key，付费模型返回 402 Insufficient account funds；
+  // 假 Key 返回 401 Invalid credential。两者必须给出不同结论，否则操作者会去换 Key。
+  const body = JSON.stringify({ error: { message: 'Upstream request failed: Insufficient account funds' } })
+  const error = await failingStream(402, body, {
+    credentials: () => [{ name: 'env', key: 'sk-test' }],
+    ...PAID_FIRST,
+    maxAttempts: () => 1,
+    backoffMs: () => 100,
+  })
+  assert.ok(error, '必须抛错')
+  assert.match(error.message, /HTTP 402/)
+  assert.match(error.message, /余额不足/, '要说清楚是没钱')
+  assert.match(error.message, /不是 Key 失效/, '要把 402 和 401 区分开')
 })
 
 // ---- 502 gateway retries ----
@@ -1455,7 +1485,7 @@ test('a tool result reaches the wire as a tool message, not as a user one', asyn
     { role: 'tool', toolCallId: 'call_1', content: [{ type: 'text', text: 'sunny, 24C' }] },
   ]
   const [call] = await captureStream({ credentials: () => [] }, { messages })
-  const wire = call.body.messages
+  const wire = wireOf(call)
 
   assert.equal(wire.length, 3)
   assert.deepEqual(wire.map((m) => m.role), ['user', 'assistant', 'tool'])
@@ -1473,7 +1503,7 @@ test('a tool result with no text still answers its call', async () => {
     { role: 'tool', toolCallId: 'call_9', content: [] },
   ]
   const [call] = await captureStream({ credentials: () => [] }, { messages })
-  const wire = call.body.messages
+  const wire = wireOf(call)
   assert.deepEqual(wire.map((m) => m.role), ['user', 'assistant', 'tool'])
   assert.equal(wire[2].tool_call_id, 'call_9')
   assert.equal(wire[2].content, '(no output)')
@@ -1514,7 +1544,7 @@ test('a tool called with no arguments reaches the wire as valid JSON', async () 
     { role: 'assistant', content: [{ type: 'text', text: 'done' }] },
   ]
   const [call] = await captureStream({ credentials: () => [] }, { messages })
-  const wire = call.body.messages
+  const wire = wireOf(call)
   const args = wire[1].tool_calls[0].function.arguments
   assert.notEqual(args, '', 'empty arguments must never reach the provider')
   assert.doesNotThrow(() => JSON.parse(args), 'arguments must be parseable JSON')
@@ -1528,7 +1558,7 @@ test('a tool result whose call has been compacted away is re-labelled, not sent 
     { role: 'tool', toolCallId: 'call_ghost', content: [{ type: 'text', text: 'orphan' }] },
   ]
   const [call] = await captureStream({ credentials: () => [] }, { messages })
-  const wire = call.body.messages
+  const wire = wireOf(call)
   // The orphan must not survive as a tool message with an unmatched id.
   const orphan = wire.find((m) => m.tool_call_id === 'call_ghost')
   assert.equal(orphan, undefined)
@@ -1634,11 +1664,14 @@ test('a key verdict is about one key and expires with it', async () => {
 })
 
 test('a probe that gets past authentication proves the key even when the model does not answer', async () => {
-  // 400/429 happen *after* the key was accepted. Treating them as failure would
+  // 400/5xx happen *after* the key was accepted. Treating them as failure would
   // lock a perfectly good key out of the rules it qualifies for, and the page
   // would say "check failed" about a key that works.
+  //
+  // 429 是例外（2026-10-27 实测）：它发生在凭据校验**之前**——同一时刻用真 Key、
+  // 伪造 Key、不带凭据拿到同一个 429，所以它证明不了这把 Key 能用，只能判「无法判定」。
   const original = globalThis.fetch
-  for (const [status, ok] of [[400, true], [429, true], [500, true]]) {
+  for (const [status, ok] of [[400, true], [500, true]]) {
     globalThis.fetch = async () => new Response('{"error":{"message":"boom"}}', {
       status,
       headers: { 'content-type': 'application/json' },
@@ -1650,6 +1683,22 @@ test('a probe that gets past authentication proves the key even when the model d
       globalThis.fetch = original
     }
     assert.equal(result.ok, ok, `HTTP ${status} after authentication must still count as ${ok}`)
+  }
+  {
+    globalThis.fetch = async () => new Response('{"error":{"type":"FreeUsageLimitError"}}', {
+      status: 429,
+      headers: { 'content-type': 'application/json', 'retry-after': '3600' },
+    })
+    let result
+    try {
+      result = await verifyKey({ baseURL: 'https://opencode.ai/zen/v1', key: 'sk-a', model: 'big-pickle' })
+    } finally {
+      globalThis.fetch = original
+    }
+    assert.equal(result.ok, false, '429 发生在凭据校验之前，不能算「已验证」')
+    assert.equal(result.inconclusive, true, '要说清楚这是无法判定，不是 Key 有问题')
+    assert.match(result.reason, /无法判定/)
+    assert.doesNotMatch(result.reason, /Key 有效，但/)
   }
   for (const status of [401, 403]) {
     globalThis.fetch = async () => new Response('{"error":{"message":"nope"}}', {
@@ -2033,7 +2082,10 @@ test('once the direct lane is refused, later turns skip it entirely', async () =
     }
 
     await run()
-    assert.equal(directCalls, 1, '第一轮要试一次直连，才知道这条路通不通')
+    // 2026-10-27 起，`auto` 在「这一轮先花公共额度」时不先打直连：该档直连必然
+    // 429（身份双因子不满足），先打一次只是白付一个往返，还会把网关的
+    // retry-after 窗口推得更长。要验证「直连能不能过」请看 `off` 模式的用例。
+    assert.equal(directCalls, 0, 'auto 下公共额度这一档直接交给客户端，不先打直连')
     assert.equal(turns.length, 1)
 
     const after = directCalls
@@ -2135,5 +2187,42 @@ test('preferPublic falls through to the key when the bridge cannot serve', async
     assert.equal(seen.filter((a) => !a.includes('sk-test')).length, 1, '公共通道不得反复重试')
   } finally {
     globalThis.fetch = originalFetch
+  }
+})
+
+test('每个请求都带 OpenCode 官方提示词，否则网关一律 429', async () => {
+  // 2026-10-27 实测：system 不完整包含这份原文时，同一份报文（凭据、头、会话、
+  // 运行时全一致）直接 429；补上原文后 200。见 lib/zen-prompt.js 顶部。
+  const prompt = opencodeSystemPrompt()
+  assert.ok(prompt.length > 20_000, '提示词快照必须存在且是完整版')
+
+  const [call] = await captureStream({ credentials: () => [] }, { messages: [{ role: 'user', content: 'hi' }] })
+  const systems = call.body.messages.filter((m) => m.role === 'system')
+  assert.equal(systems.length, 1, 'system 必须合并成一条')
+  assert.ok(systems[0].content.includes(prompt), '必须完整包含官方原文，截断/改写都会 429')
+  assert.ok(
+    systems[0].content.indexOf(prompt) === 0,
+    '原文放最前：它是固定前缀，上游 prompt cache 才能命中',
+  )
+})
+
+test('注入不叠加：宿主回传已带原文的 system 时原样放行', () => {
+  const prompt = opencodeSystemPrompt()
+  const once = withOpencodePrompt([{ role: 'system', content: 'HOST' }, { role: 'user', content: 'hi' }])
+  const twice = withOpencodePrompt(once)
+  assert.equal(twice, once, '同一份消息不得被二次注入')
+  assert.equal(once[0].content.split(prompt.slice(0, 200)).length - 1, 1, '原文只出现一次')
+})
+
+test('测试运行器里不 fork Bun 子进程，除非显式要求', () => {
+  const adapter = new OpenCodeFreeAdapter(null, { enabled: () => true }, {})
+  // Node 的测试运行器会设置 NODE_TEST_CONTEXT；单测若去 fork 子进程，就变成
+  // 环境依赖（还得本机装 Bun），而且每个用例都要握手一次。
+  assert.equal(adapter.egressEnabled(), false)
+  process.env.ZEN_EGRESS = 'on'
+  try {
+    assert.equal(adapter.egressEnabled(), true, '显式开启时必须生效')
+  } finally {
+    delete process.env.ZEN_EGRESS
   }
 })

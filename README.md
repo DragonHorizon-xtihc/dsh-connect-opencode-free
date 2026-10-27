@@ -73,7 +73,7 @@ Zen 的模型接口不返回 `Access-Control-Allow-Origin`，浏览器读不到�
 - **推理档位**：目录标为 `reasoning` 的模型声明 `off/low/high/max` 四档，选择器据此提供选项，显式指定的档位才不会被 llm 服务以 `UNSUPPORTED_REASONING_EFFORT` 拒绝；`off` 用省略字段表示，因为 Zen 不接受该取值。不设默认档，保留 Zen 自己的默认。
 - **额度顺序**：由 `quotaPolicy` 决定（详见[使用规则](#使用规则三档额度策略)），默认 `publicOnly`——只用公共免费额度。每个 Key 名先查 Harness 凭据库（设置里保存的 key 在这里，不在环境变量里），再查进程环境。
 - **失败提示**：429 区分「公共额度」与「自有账号」，401/403 说明是凭据被拒还是没给，并给出下一步（去哪取 key、检查哪个账号），而不是只抛一个状态码。两条额度都用尽时，报**第一个失败的 Key** 而不是最后一个——要修的是它。
-- **出网方式**：默认直连（`bridgeMode: off`），不启动任何外部进程。`bridge` 保留为手动选项，详见[报错：HTTP 429](#报错http-429-额度已用尽就是额度不是身份)。
+- **出网方式**：请求经一个 Bun 子进程转发，并自动注入 OpenCode 官方提示词——Zen 免费档要求这两样同时满足，缺一即 429。没有 Bun 时可用 `BUN_BE_BUN=1` 复用 OpenCode 自带运行时；`ZEN_EGRESS=off` 可退回直连。详见[报错：HTTP 429](#报错http-429-freeusagelimiterror)。
 
 ## 设置
 
@@ -95,7 +95,7 @@ Zen 的模型接口不返回 `Access-Control-Allow-Origin`，浏览器读不到�
 | `retryBackoffMs`       | `800`                         | 重试初始退避，按次数指数增长                                                                               |
 | `defaultContextWindow` | `200000`                      | 目录未给大小时的兜底                                                                                   |
 | `realGateTools`        | `true`                        | 把网关要求的 `bash`/`read` 注册成真实可执行工具；关闭后它们只是占位，模型调用会被忽略并提示（**即时生效**，无需重启）                         |
-| `bridgeMode`           | `off`                         | 出网方式：`off`（默认）插件直连；`auto` 直连被拒后改由本机 OpenCode 客户端代发；`on` 总是代发。后两者需要本机装有 OpenCode，且宿主工具会改走文本协议。详见[报错：HTTP 429](#报错http-429-额度已用尽就是额度不是身份) |
+| `bridgeMode`           | `off`                         | 实验性备选。`off`（默认）由插件自己的 Bun 转发进程出网；`auto`/`on` 改为交给本机 `opencode serve` 代发，需要装有 OpenCode，且宿主工具会改走文本协议。详见[报错：HTTP 429](#报错http-429-freeusagelimiterror) |
 | `disabledModels`       | `[]`                          | 停用的模型 id                                                                                     |
 | `manualModels`         | `[]`                          | 手动添加的模型                                                                                      |
 | `bridgePort`           | `18766`                       | 目录桥端口                                                                                        |
@@ -230,48 +230,114 @@ OpenCode's free tier can only be used from within OpenCode. …
 
 保持默认的「仅使用公共额度」即可——这正是默认值，不需要配 Key 也不需要额外操作。插件不会把请求转给 Key，但遇到 429/403 时会先试一次 `bridge`：交给本机 OpenCode 客户端代发，那仍然是公共额度。
 
-## 报错：HTTP 429 额度已用尽（就是额度，不是身份）
+## 报错：HTTP 429 FreeUsageLimitError
 
 ```
-OpenCode Zen 公共免费额度已用尽（HTTP 429）：Rate limit exceeded. Please try again later.
-网关建议约 367 分钟后重试；或到 https://opencode.ai/zen 取一个 key……（已重试 3 次均失败）
+OpenCode Zen 公共免费额度已用尽（HTTP 429）：Free usage limit reached. Free models work in OpenCode …
+网关建议约 360 分钟后重试；或到 https://opencode.ai/zen 取一个 key……
 ```
 
-这个提示是字面意思：**免费额度用完了**。等网关给出的时间回来，或者用自己的 Key。
+这条 429 有**两个完全不同的成因，响应体却一模一样**，只能靠实验区分：
 
-短窗口（几秒到两分钟）会照常退避重试；窗口长达数小时时不重试——等不起，也不该让
-你以为「已经重试过了」。
+| 成因 | 怎么认 |
+| --- | --- |
+| ① 免费额度真的用完了 | 同一时刻用本机 OpenCode 问一句，也报同样的错 |
+| ② 请求没被当成 OpenCode 客户端 | OpenCode 能正常回答，插件却 429 |
+
+### 认定为 ①：等窗口，或用 Key
+
+`retry-after` 给出的是窗口重开时间（实测 6–22 小时）。短窗口（几秒到两分钟）会照常退避
+重试；数小时的窗口不重试——等不起，也不该让你以为「已经重试过了」。
+
+**这个 429 与凭据无关。** 实测同一时刻用真 Key、伪造 Key、不带凭据请求免费模型，三者拿到
+**同一个 429**（`retry-after` 一致）——拒绝发生在凭据校验之前。所以看到它**不要**去换 Key。
+
+要确认 Key 本身的状态，用 `*-free` 以外的模型试一次（不花钱就能判，见下面的 402 一节）：
+
+| 响应 | 含义 |
+| --- | --- |
+| 401 `Invalid credential` / `Missing API key` | Key 无效或没带上 |
+| 402 `Insufficient account funds` | **Key 有效**，但账户没有余额 |
+| 200 | Key 有效且有余额 |
+
+### 认定为 ②：两个因子必须同时满足
+
+2026-10-27 逐项排除后定案，**缺任何一个都是 429**：
+
+1. **system 必须完整包含 OpenCode 官方提示词原文**（约 5.5 万字符）。
+   截断、只留第一句、只留前半段，全部 429；把前半段重复拼到同样的字符数，仍然 429
+   ——所以校验的是内容完整性，不是长度。在原文**前后追加**说明则不影响。
+2. **HTTP 客户端必须是 Bun 的 TLS 栈**。
+   同一份报文、同一份 system：Node 的 `https`/`undici` 一律 429，Bun 1.3.12 / 1.4.4 一律 200。
+
+插件已内置这两件事，正常情况下不需要你操心：
+
+| 因子 | 实现 |
+| --- | --- |
+| 官方提示词 | `lib/opencode-system-prompt.txt` + `lib/zen-prompt.js`（作为固定前缀注入 system，利于 prompt cache） |
+| Bun TLS 栈 | `lib/zen-egress.js` + `lib/zen-egress-runner.mjs`（Node 把请求交给一个 Bun 子进程转发） |
+
+**前提是机器上有 Bun**：优先用 `~/.bun/bin/bun`；没有时用 `BUN_BE_BUN=1` 复用 OpenCode
+自带的运行时（`opencode-cli`）。两者都找不到就退回直连（会 429，日志会说明原因）。
+`ZEN_EGRESS=off` 可强制退回直连。
+
+自查与维护：
+
+```bash
+node scripts/verify-egress.mjs            # 通道自检，不消耗额度
+node scripts/verify-egress.mjs --chat     # 额度恢复后验证真实对话
+node scripts/refresh-opencode-prompt.mjs  # OpenCode 升级后重新取样提示词（不消耗额度）
+```
+
+`refresh-opencode-prompt.mjs` 若卡在「没收到请求」，改用 `--serve`，它会打印一条可在自己
+终端执行的命令（有些环境下 CLI 需要 TTY）。
+
+### 已排除的变量（别再重复试）
+
+UA 格式（真实值是 `opencode/latest/<版本>/cli`）、端点（`/zen/v1` 与 `/inference/openai/v1`
+都试过）、出口 IP（直连与本地代理同一出口）、CF 边缘节点、HTTP/2、全部 `x-opencode-*` 头、
+`b3`/`traceparent`、会话（新的/旧的/空的）、凭据（OpenCode 自己也是 `Bearer public`，
+`OPENCODE_API_KEY` 长度为 0）。
 
 ### 一段走弯路的记录（留在这里，免得后人重走）
 
-2026-10-18 这天，我曾把这句 429 判成「网关在识别发出者」的伪装，理由是：同一时刻，
-真实 OpenCode 客户端 200、插件探针 429。当时把头集合、会话、模型、工具表（含宿主
-真实的 347 个）、TLS 指纹（Bun/BoringSSL、ALPN、密码套件、曲线、签名算法）逐一对照
-过，仍然是 429，于是断定「判定在传输层，插件伪造不了」，还为此默认开启了 bridge。
+这个 429 先后被误判过两次：
 
-**那个结论是错的。** 错在对照没有控制住一个变量：**额度会随时间被消耗**。客户端那次
-200 恰好用掉了最后的余量，紧接着的探针自然 429——我把「额度刚好用完」读成了「发出者
-不被承认」。
+- **2026-10-18：判成「就是额度」。** 依据是后来同会话连打 8 次全 200。但那次探针用的
+  报文没有带官方 system，所以它根本不在同一个判定分支里——「等一会儿就好了」是巧合。
+- **同一天早些时候：判成「网关在识别发出者」**，并因此默认开启 bridge。方向对了一半
+  （确实有两个因子），但只在 HTTP 头、会话、TLS 指纹里找，没往**请求体**里看，于是
+  得出了「插件伪造不了」的过度结论。
 
-推翻它几乎不花钱：停手一段时间后，**同一会话、同一模型、同一份报文的直连连打 8 次，
-全部 200**（`scripts/probe-rate-limit.mjs`）。如果判据是身份，它不可能因为等待而改变。
+真正的教训是：**当 429 同时能被多种原因解释时，先做「同一报文 + 单一变量」的对照，
+并且用一份能成功的真实请求做基线**（`scripts/capture-opencode-request.mjs` 负责抓，
+`scripts/refresh-opencode-prompt.mjs` 负责复现）。
 
-教训：当 429 同时能被「额度」和「被针对」解释时，先怀疑额度——它是唯一会因为**你多试
-几次而恶化**的东西。密集探针把 `retry-after` 从 6 小时推到 22 小时，等于给自己加刑。
+### 出网方式
 
-### 出网方式：默认直连，不需要任何外部客户端
+`bridgeMode` 现在默认 `off`：上面两个因子由插件自己满足，不需要把请求交给本机客户端。
 
-`bridgeMode` 默认 `off`：插件直接请求 Zen，不启动任何进程。
-
-`bridge`（把请求交给本机 OpenCode 客户端代发）保留为手动选项，只在真出现「客户端能过、
-插件不能」时才有意义——那种情形目前没有证据。打开它要付代价：宿主工具无法再用原生
+`bridge`（交给 `opencode serve` 代发）保留为实验性备选：代价是宿主工具无法再用原生
 function-calling，得改走 system 里的一段 JSON 协议。
 
 | 你想要 | 怎么做 |
 | --- | --- |
-| 用公共免费额度 | 默认即可（`bridgeMode: off`）。额度用尽时等 `retry-after` |
+| 用公共免费额度 | 默认即可，需要本机有 Bun（或装有 OpenCode 以便复用其运行时） |
 | 用自己 Key 的额度 | 配 `apiKeys`，`quotaPolicy` 保持 `publicOnly` 或改 `preferKey` |
 | 免费优先、Key 兜底 | `quotaPolicy: preferPublic` + 配 Key |
+| 完全不启用 forwarder | `ZEN_EGRESS=off`（会回到直连，免费档 429） |
+
+## 报错：HTTP 402 账户余额不足
+
+```
+OpenCode Zen 该账号余额不足（HTTP 402）：Upstream request failed: Insufficient account funds
+```
+
+**Key 是好的，账户没钱。** 402 与 401 必须分开看：401 说明 Key 无效，402 说明认证已经通过、
+只是余额为零。2026-10-27 实测同一把 Key：付费模型 402、伪造 Key 401、不带凭据 401——
+所以 402 本身就是「Key 有效」的证据。
+
+处理方式：到 https://opencode.ai/zen 充值，或改用 `*-free` 模型（等免费档窗口恢复）。
 
 ## 报错：HTTP 502，但内容其实是对话太长
 
@@ -346,6 +412,8 @@ threshold      = min(200000 × 0.8, 102464)          = 102464   ← 本该在这
 `refreshKeyed()`（重查凭据池）**刻意没有**加同样的守卫：凭据也可能在插件之外被改（账号页），跳过查询会让徽标描述一把已经不存在的 Key。它是 fire-and-forget，本来就不在点击路径上。
 
 ## 兼容性
+
+**运行前提**：宿主 Node 22+；另需一个 Bun 运行时用于出网（`~/.bun/bin/bun`，或用 `BUN_BE_BUN=1` 复用 OpenCode 的 `opencode-cli`）。两者都找不到时插件仍能启动，但请求会退回直连，Zen 免费档会 429（日志里有明确说明）。
 
 浏览器半边的 `inject` 只有 `['slots', 'locale']` —— 这两个服务在任何 Host 版本上都存在。设置服务 `configForms` 通过 `ctx.get()` 软探测：Cordis 的依赖门是硬性的，声明一个当前 Host 没有提供的服务会让 `apply` 永不执行，页面直接消失。
 
