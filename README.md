@@ -52,7 +52,7 @@
 1. 进入目标 profile 目录（如 `~/.dsh/profiles/<profile-name>`）。
 2. 在 `package.json` 的 `dependencies` 中加入：
    ```json
-   "dsh-connect-opencode-free": "^0.5.0"
+   "dsh-connect-opencode-free": "^0.5.1"
    ```
 3. 在同文件的 `dsh.profile.bundles` 数组中登记包名：
    ```json
@@ -475,6 +475,10 @@ npm test         # 单元测试
 - `scripts/smoke-page.mjs` —— 用 mock 的 `locale`/`slots`/`configForms` 驱动真实产物，把页面在 6 种配置状态（空 Key、已填 Key、两种 Key 门禁规则、手动模型、弃用开关）下各渲染一遍，逐个核对页面请求的翻译键都存在于语言表里。
 
 ## 更新日志
+
+### 0.5.1
+
+- 修复 403 排查一节指向 429 小节的失效锚点（仅文档改动）。
 
 ### 0.5.0
 
