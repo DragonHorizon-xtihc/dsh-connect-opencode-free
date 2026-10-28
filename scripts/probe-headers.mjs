@@ -21,21 +21,23 @@ const base = (seed) => ({
   'x-opencode-session': session(seed),
 })
 
+const CWD = process.cwd()
+
 const cases = [
   ['1 baseline: session only', {}],
   ['2 + x-opencode-client: cli', { 'x-opencode-client': 'cli' }],
   ['3 + client + request', { 'x-opencode-client': 'cli', 'x-opencode-request': randomUUID() }],
   ['4 + project/directory/workspace', {
     'x-opencode-project': 'global',
-    'x-opencode-directory': 'D:/ClaudeCode/deepseek-harness/plugins/dsh-connect-opencode-free',
-    'x-opencode-workspace': 'D:/ClaudeCode/deepseek-harness',
+    'x-opencode-directory': CWD,
+    'x-opencode-workspace': CWD,
   }],
   ['5 ALL: client+request+project+dir+ws', {
     'x-opencode-client': 'cli',
     'x-opencode-request': randomUUID(),
     'x-opencode-project': 'global',
-    'x-opencode-directory': 'D:/ClaudeCode/deepseek-harness/plugins/dsh-connect-opencode-free',
-    'x-opencode-workspace': 'D:/ClaudeCode/deepseek-harness',
+    'x-opencode-directory': CWD,
+    'x-opencode-workspace': CWD,
     'x-opencode-session-id': session('sid'),
   }],
   ['6 client=cli only, no session', { 'x-opencode-client': 'cli', NO_SESSION: '1' }],

@@ -1,12 +1,20 @@
 # dsh-connect-opencode-free
 
+[![npm version](https://img.shields.io/npm/v/dsh-connect-opencode-free.svg)](https://www.npmjs.com/package/dsh-connect-opencode-free)
+[![license](https://img.shields.io/npm/l/dsh-connect-opencode-free.svg)](LICENSE)
+[![node](https://img.shields.io/node/v/dsh-connect-opencode-free.svg)](package.json)
+
 把 **OpenCode Zen** 的免费模型接进 **DeepSeek Harness**：实时发现官方免费档模型，在设置里逐个启停，一键写入 provider。**免 key**，认证固定为 `Bearer public`。
+
+- 仓库：<https://github.com/DragonHorizon-xtihc/dsh-connect-opencode-free>
+- npm：<https://www.npmjs.com/package/dsh-connect-opencode-free>
 
 > OpenCode Zen 是第三方公开服务，其可用性、模型清单与限流策略由其运营方决定。本插件只是客户端适配层。
 
 ## 功能
 
 - **免 key 接入 OpenCode Zen 免费档**：匿名通道复用公开额度，认证固定为 `Bearer public`；为通过免费档校验，适配器会伪装成 OpenCode CLI（特定的 `User-Agent`、`x-opencode-session` 会话 id，以及 `bash`/`read` 工具名）。
+- **两项硬性条件已内置**：免费档要求 system 完整包含 OpenCode 官方提示词原文（约 5.5 万字符），且 HTTP 客户端必须走 Bun 的 TLS 栈——两者同时满足才不再 429。插件固定注入官方提示词，并经 Bun 子进程转发请求。详见[报错：HTTP 429](#报错http-429-freeusagelimiterror)。
 - **`bash`/`read` 是真工具，不是占位**：免费档网关要求请求里必须出现 `bash` 与 `read` 两个名字，只挂名字不实现会让模型去调一个永远无法执行的工具、整轮被带偏（这正是同一模型在 OpenCode 里流畅、走本插件却报错的原因）。因此插件把这两个名字注册成**真实可执行**的工具（见 `lib/gate-tools.js`）。
 - **双源模型发现**：实时合并 `opencode.ai/zen/v1/models`（此刻真实存在哪些 id）与 `models.dev/api.json` 的 `opencode` 段（哪些免费、上下文多大、支持什么能力），任一源不可达仍沿用上次结论，一次网络抖动不会让模型凭空消失。
 - **设置页一键管理**：搜索、逐个启停、全部启用/停用、限流状态与恢复时间一目了然。
@@ -27,33 +35,54 @@
 | Key 录入 | `lib/core.js` + `lib/index.js` | 行号 → 环境变量名的映射（`apiKeyNameFor`）与注入/撤回                   |
 | 宿主     | `lib/index.js`                 | 注册 `opencode-free` 路由、周期发现、目录缓存、本机目录桥                  |
 | 适配器    | `lib/provider.js`              | 免 key 的 OpenAI 兼容 adapter：流式块边界、工具调用、推理档位、退避重试         |
+| 出网     | `lib/zen-egress.js` + `lib/zen-egress-runner.mjs` | 把请求交给 Bun 子进程转发，满足免费档对 TLS 栈的要求            |
+| 官方提示词  | `lib/zen-prompt.js` + `lib/opencode-system-prompt.txt` | 作为固定前缀注入 OpenCode 官方 system 原文，利于 prompt cache |
+| 网关工具   | `lib/gate-tools.js`            | 把网关要求的 `bash` / `read` 注册成真实可执行工具                       |
+| 备选出网   | `lib/oc-bridge.js`             | 实验性：交给本机 `opencode serve` 代发（`bridgeMode`）                 |
 | 浏览器    | `src/client.js`                | React 设置页，注册进 `settings.section` 槽位                    |
 
 浏览器半边的产物 `lib/client.cjs` 由 `scripts/build.mjs` 从 `lib/core.js` + `src/client.js` 生成 —— 客户端模块系统的 `require` 只能解析包名和平台种子词，无法解析相对路径，所以共享逻辑必须内联。构建脚本还会拒绝任何未被内联的相对 import。
 
 ## 安装
 
-本插件是一个 DSH **cordis 插件包（bundle）**，通过 profile 的 `package.json` 接入；在开发态用源码软链即可运行，无需先发布。
+本插件是一个 DSH **cordis 插件包（bundle）**，通过 profile 的 `package.json` 接入。
 
-1. 进入目标 profile 目录（例如 `E:/UserAgentData/.dsh/profiles/web`）。
-2. 在 `package.json` 的 `dsh.profile.bundles` 数组里加入包名：
+### 方式一：npm 安装（推荐）
+
+1. 进入目标 profile 目录（如 `~/.dsh/profiles/<profile-name>`）。
+2. 在 `package.json` 的 `dependencies` 中加入：
+   ```json
+   "dsh-connect-opencode-free": "^0.5.0"
+   ```
+3. 在同文件的 `dsh.profile.bundles` 数组中登记包名：
    ```json
    "dsh-connect-opencode-free"
    ```
-3. 在同文件 `dependencies` 中登记依赖。开发态用 `link:` 指向本仓库源码：
-   ```json
-   "dsh-connect-opencode-free": "link:D:/ClaudeCode/deepseek-harness/plugins/dsh-connect-opencode-free"
-   ```
-   若要安装发布版，则写版本范围，例如 `"^0.4.1"`。
-4. 在该 profile 目录执行安装（会重新解析软链并应用 `cordis.patch.yml`）：
+4. 在 profile 目录执行安装（会应用 `cordis.patch.yml`）：
    ```sh
    pnpm install
    ```
 5. 启动对应 profile（如 `dsh web`），打开「设置 → OpenCode 免费模型」即可使用。
 
-依赖要求：Node ≥ 18，且宿主提供 `@deepseek-ai/dsh-llm`（peer 范围 `>=0.1.7-rc.1 <0.3.0`）。`cordis.patch.yml` 由 `package.json` 的 `dsh.bundle.patch` 自动加载，无需手动处理。
+### 方式二：从源码安装（开发态）
 
-> 提示：宿主半边的 `lib/` 为源码，`lib/client.cjs` 是 `npm run build` 生成的浏览器半边产物；若该 bundle 需要随仓库分发，请确保已执行构建（或仅在此开发树内 `link` 使用）。
+1. 克隆仓库并构建：
+   ```sh
+   git clone https://github.com/DragonHorizon-xtihc/dsh-connect-opencode-free.git
+   cd dsh-connect-opencode-free
+   pnpm install
+   pnpm build
+   ```
+   仓库已提交 `lib/` 构建产物，仅在改动 `src/` 后需要重新构建。
+2. 在 profile 的 `dependencies` 中用 `link:` 指向本地源码目录（换成你自己的路径）：
+   ```json
+   "dsh-connect-opencode-free": "link:/absolute/path/to/dsh-connect-opencode-free"
+   ```
+3. `dsh.profile.bundles` 同样加入包名，执行 `pnpm install`，启动 profile。
+
+依赖要求：包本身 `Node ≥ 18`，DSH 宿主当前要求 Node 22+；宿主需提供 `@deepseek-ai/dsh-llm`（peer 范围 `>=0.1.7-rc.1 <0.3.0`）。`cordis.patch.yml` 由 `package.json` 的 `dsh.bundle.patch` 自动加载，无需手动处理。
+
+> 免费档出网还需要一个 Bun 运行时（`~/.bun/bin/bun`，或用 `BUN_BE_BUN=1` 复用 OpenCode 自带的 `opencode-cli`）。没有额外 Bun 时插件仍能启动，但请求会退回直连并被 Zen 拒绝，详见[兼容性](#兼容性)。
 
 ## 模型发现
 
@@ -428,15 +457,15 @@ npm run smoke    # 构建 + TDZ 扫描 + 设置页渲染冒烟
 npm test         # 单元测试
 ```
 
+构建产物 `lib/` 随仓库提交：`dsh plugin add github:...` 这类安装方式默认不跑安装脚本，缺了 `lib/index.js` 就没有可加载的入口。因此每次改完 `src/`，都要重新构建并把 `lib/` 一起提交。
+
 ### 改设置页后必须重新构建，光重启无效
 
 `lib/client.cjs` 是**生成产物**（`scripts/build.mjs` 把 `lib/core.js` + `src/client.js` 内联成浏览器工厂），浏览器加载的是它，不是 `src/client.js`。因此改完页面源码后：
 
 1. `npm run build`（或 `npm run smoke`，它包含构建）；
-
-
-1. 重启 `dsh web`；
-2. 浏览器硬刷新（Ctrl+F5），否则拿到的是缓存里的旧工厂。
+2. 重启 `dsh web`；
+3. 浏览器硬刷新（Ctrl+F5），否则拿到的是缓存里的旧工厂。
 
 只重启进程、不重新构建，页面会继续表现旧代码的行为——包括旧缺陷。已经因此吃过一次：页面空白的根因（一个 `const` 在声明前被读取）早已在 `src/client.js` 里修好，但产物没重建，重启多少次都还是白屏。
 
@@ -444,6 +473,21 @@ npm test         # 单元测试
 
 - `scripts/tdz-scan.mjs` —— 静态扫描页面组件里「先读后声明」的局部变量。这类错误 `node --check` 看不见，单元测试也不导入页面，只会在渲染时抛 `ReferenceError`，表现为整页空白。扫描前会用一份还原了该缺陷的样件自证抓得到。
 - `scripts/smoke-page.mjs` —— 用 mock 的 `locale`/`slots`/`configForms` 驱动真实产物，把页面在 6 种配置状态（空 Key、已填 Key、两种 Key 门禁规则、手动模型、弃用开关）下各渲染一遍，逐个核对页面请求的翻译键都存在于语言表里。
+
+## 更新日志
+
+### 0.5.0
+
+- 免费档出网改由 Bun 子进程转发，并固定注入 OpenCode 官方提示词原文——两者同时满足才不再 429（见 [报错：HTTP 429](#报错http-429-freeusagelimiterror)）。
+- `bash` / `read` 改为真实可执行工具（`realGateTools`），模型不再调用空占位。
+- `bridgeMode` 默认 `off`，本机 `opencode serve` 代发降级为实验性备选。
+- README 重写安装章节：npm 安装与源码安装分开，去掉本机路径。
+
+### 0.4.0
+
+- 设置页逐行录入 Key，自动投影为 `OPENCODE_API_KEY[_N]` 环境变量，删行即撤回。
+- Key 校验探针补齐四个网关信号（CLI UA、真实会话 id、`bash`/`read` 工具、流式）。
+- 修复设置页 TDZ 白屏，新增 `tdz-scan` + 渲染冒烟守住渲染期缺陷。
 
 ## 致谢
 

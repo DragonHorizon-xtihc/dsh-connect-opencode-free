@@ -3,12 +3,16 @@
 // GET /models — a model that left the free tier (or was renamed) would answer
 // 403 FreeTierError on every call even with a real session and bash/read.
 import { readFileSync } from 'node:fs'
+import { homedir } from 'node:os'
+import { join } from 'node:path'
 import { realSessionId } from '../lib/oc-session.js'
 
 const BASE = 'https://opencode.ai/zen/v1'
 const UA = 'opencode/1.18.18 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14'
 
-const catalog = JSON.parse(readFileSync('E:/UserAgentData/.dsh/cache/opencode-zen-catalog.json', 'utf8'))
+const dshHome = process.env.DSH_HOME || join(homedir(), '.dsh')
+const catalogPath = process.env.ZEN_CATALOG_PATH || join(dshHome, 'cache', 'opencode-zen-catalog.json')
+const catalog = JSON.parse(readFileSync(catalogPath, 'utf8'))
 const models = (catalog.catalog ?? catalog).map(m => m.id).filter(Boolean)
 
 const { id: SID, reason } = await realSessionId()

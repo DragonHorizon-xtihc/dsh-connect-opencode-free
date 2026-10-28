@@ -1,8 +1,10 @@
 // Probe: (a) can we read a REAL Zen session id from the local OpenCode db?
 //        (b) does the gate need the real session AND the bash/read tools?
 import { DatabaseSync } from 'node:sqlite'
+import { homedir } from 'node:os'
+import { join } from 'node:path'
 
-const DB = 'C:/Users/user/.local/share/opencode/opencode.db'
+const DB = process.env.OPENCODE_DB || join(homedir(), '.local', 'share', 'opencode', 'opencode.db')
 const BASE = 'https://opencode.ai/zen/v1'
 const UA = 'opencode/1.18.18 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14'
 
