@@ -2097,43 +2097,83 @@ test('once the direct lane is refused, later turns skip it entirely', async () =
   }
 })
 
-test('a 429 with a long window is reported at once instead of retried', async () => {
-  // 免费档的额度窗口实测是 6–22 小时量级，而默认退避三次加起来不过十几分钟：等到
-  // 窗口重开是不可能的，白白占住一轮对话还让人以为「已经重试过」。
+test('短窗口 429 退避重试公共通道，长窗口 429 不重试（避免延长冷却）', async () => {
+  // 2026-11-03 修订：网关的 `retry-after` 是**真实**倒计时（实测 75555s 随真实时间
+  // 逐秒递减，不是固定话术）。所以 429 要分两种处理：
+  //   · 短窗口（几十秒）= 偶发抖动，退避重试能过（用户「重新请求一样可以」即此）。
+  //   · 长窗口（十几小时）= 日额度真关了，再打只是密集探针、延长冷却，应转交 key 或结束。
+  // 这里仍要验证 quota 记住长窗口（面板要能说清什么时候恢复），但不再用它决定是否重试短窗口。
   const quota = new QuotaTracker('')
   quota.record(1_000, { headers: { get: (name) => (name === 'retry-after' ? '22000' : null) } })
   assert.ok(quota.state.resetAt > 1_000, '长窗口要记下来，面板才能说清什么时候恢复')
   assert.equal(quota.publicLaneClosed(1_001), true, '窗口内不必再打公共通道')
 
   const body = JSON.stringify({ type: 'error', error: { type: 'FreeUsageLimitError', message: 'Rate limit exceeded' } })
-  let calls = 0
-  const originalFetch = globalThis.fetch
-  globalThis.fetch = async () => {
-    calls += 1
-    return new Response(body, { status: 429, headers: { 'content-type': 'application/json', 'retry-after': '22000' } })
+
+  // 用例一：短窗口（30s）的偶发 429 —— 必须退避重试。
+  {
+    let calls = 0
+    const originalFetch = globalThis.fetch
+    globalThis.fetch = async () => {
+      calls += 1
+      return new Response(body, { status: 429, headers: { 'content-type': 'application/json', 'retry-after': '30' } })
+    }
+    try {
+      const adapter = new OpenCodeFreeAdapter(null, { enabled: () => true }, {
+        credentials: () => [],
+        session: async () => ({ id: TEST_SESSION_ID, source: 'test' }),
+        maxAttempts: () => 5,
+        backoffMs: () => 1,
+        bridgeMode: () => 'off',
+      })
+      adapter.setModels([{ id: 'big-pickle', name: 'Big Pickle' }])
+      const error = await (async () => {
+        try {
+          for await (const chunk of adapter.stream({ model: 'big-pickle', messages: [] })) void chunk
+          return null
+        } catch (e) {
+          return e
+        }
+      })()
+      assert.ok(error, '必须抛错')
+      assert.ok(calls > 1, `短窗口 429 必须重试（实际只打了 ${calls} 次）——偶发抖动退避能过`)
+      assert.match(error.message, /分钟后重试|稍后重试/, '要给出重开时间')
+    } finally {
+      globalThis.fetch = originalFetch
+    }
   }
-  try {
-    const adapter = new OpenCodeFreeAdapter(null, { enabled: () => true }, {
-      credentials: () => [],
-      session: async () => ({ id: TEST_SESSION_ID, source: 'test' }),
-      maxAttempts: () => 5,
-      backoffMs: () => 1,
-      bridgeMode: () => 'off',
-    })
-    adapter.setModels([{ id: 'big-pickle', name: 'Big Pickle' }])
-    const error = await (async () => {
-      try {
-        for await (const chunk of adapter.stream({ model: 'big-pickle', messages: [] })) void chunk
-        return null
-      } catch (e) {
-        return e
-      }
-    })()
-    assert.ok(error, '必须抛错')
-    assert.equal(calls, 1, `长窗口不该重试（实际打了 ${calls} 次）`)
-    assert.match(error.message, /分钟后重试|稍后重试/, '要给出重开时间')
-  } finally {
-    globalThis.fetch = originalFetch
+
+  // 用例二：长窗口（22000s≈6h）的 429 —— 公共通道只打一次，不要密集重试延长冷却。
+  {
+    let calls = 0
+    const originalFetch = globalThis.fetch
+    globalThis.fetch = async () => {
+      calls += 1
+      return new Response(body, { status: 429, headers: { 'content-type': 'application/json', 'retry-after': '22000' } })
+    }
+    try {
+      const adapter = new OpenCodeFreeAdapter(null, { enabled: () => true }, {
+        credentials: () => [],
+        session: async () => ({ id: TEST_SESSION_ID, source: 'test' }),
+        maxAttempts: () => 5,
+        backoffMs: () => 1,
+        bridgeMode: () => 'off',
+      })
+      adapter.setModels([{ id: 'big-pickle', name: 'Big Pickle' }])
+      const error = await (async () => {
+        try {
+          for await (const chunk of adapter.stream({ model: 'big-pickle', messages: [] })) void chunk
+          return null
+        } catch (e) {
+          return e
+        }
+      })()
+      assert.ok(error, '必须抛错')
+      assert.equal(calls, 1, `长窗口 429 公共通道只打一次（实际 ${calls} 次）——连打只会延长冷却`)
+      assert.match(error.message, /分钟后重试|稍后重试/, '要给出重开时间')
+    } finally {
+      globalThis.fetch = originalFetch
+    }
   }
 })
 
