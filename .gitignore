@@ -25,3 +25,4 @@ release-body.md
 # Local deployment backups of lib/ (never commit these)
 _backup-lib-*/
 /.workbuddy
+/package-lock.json
