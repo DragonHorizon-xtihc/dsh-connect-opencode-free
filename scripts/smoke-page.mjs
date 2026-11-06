@@ -66,6 +66,7 @@ const reactStub = {
     const value = typeof init === 'function' ? init() : init
     return [value, () => {}]
   },
+  useRef(init) { return { current: init } },
   useCallback(fn) { return fn },
   useMemo(fn) { return fn() },
   useEffect() {},

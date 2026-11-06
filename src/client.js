@@ -8,7 +8,10 @@
 //   · 模型启停  — toggle each model in or out of the picker
 //   · 手动补模型 — ids the catalog does not carry
 //   · 一键写入  — write the llm-pi-ai provider profile
-//   · 额度状态  — whether the free tier is currently throttled, and until when
+//   · 额度状态  — whether the client-internal free tier is throttled, and until when
+//
+// 对话请求不走浏览器也不走宿主 HTTP：宿主把每一轮交给本机真实的
+// `opencode serve` 进程代发（bridge-only），认证与请求头由客户端自己负责。
 //
 // The catalog itself is fetched from the Host over a loopback bridge, because
 // Zen's model endpoint answers without `Access-Control-Allow-Origin` and the
@@ -22,12 +25,9 @@ import {
   BRIDGE_PORT_SPAN,
   DEFAULT_BRIDGE_PORT,
   ENTRY_ID,
-  KEY_GATED_POLICIES,
   LOG_PREFIX,
   PROVIDERS_NS,
-  QUOTA_POLICIES,
   ZEN_ROUTE_ID,
-  apiKeyNameFor,
   buildProviderEntry,
   buildModelSet,
   clampInt,
@@ -37,7 +37,7 @@ import {
 } from '../lib/core.js'
 
 const react = require('react')
-const { useCallback, useEffect, useMemo, useState } = react
+const { useCallback, useEffect, useMemo, useRef, useState } = react
 const h = react.createElement
 
 /** Locale namespace owned by this page. */
@@ -48,7 +48,7 @@ const CATALOG_POLL_MS = 20_000
 
 const zh = {
   title: 'OpenCode 免费模型',
-  intro: '从 OpenCode Zen 与 models.dev 实时发现免费模型，逐个启停，或一键写入 llm-pi-ai provider。免 key，认证为 Bearer public。',
+  intro: '从 OpenCode Zen 与 models.dev 实时发现免费模型，逐个启停，或一键写入 llm-pi-ai provider。每一轮对话都由本机 OpenCode 客户端代发（bridge），插件不配置任何 Key。',
   enabled: '启用插件',
   enabledHint: '关闭后所有免费模型从模型选择器撤下，已选中的消息会被拒绝。',
   search: '搜索模型',
@@ -85,15 +85,10 @@ const zh = {
   vision: '图像',
   fromZen: 'Zen 直报',
   fromManual: '手动',
-  quotaOk: '公共免费额度正常',
-  quotaThrottled: '公共免费额度已被限流，预计 {time} 后恢复',
+  quotaOk: 'OpenCode 客户端内免费档正常',
+  quotaThrottled: 'OpenCode 客户端内免费档已被限流，预计 {time} 后恢复',
   quotaHits: '累计被限流 {count} 次',
-  quotaRefused: '公共免费额度通道已被拒绝（{time} 前），期间改用私有额度',
-  quotaClosed: '公共免费额度暂不可用，本次会直接用私有额度',
-  keyConfigured: '已配置 {count} 个 Key · 当前规则：{policy}',
-  noKeyOnly: '未配置 Key：只能用公共免费额度',
-  laneRule: '额度规则：每次调用先走公共免费额度；只有出现「公共免费额度已用尽」或「拒绝了匿名免费档调用」时才回退到已配置的 Key。窗口过后自动回到公共额度。',
-  keyed: '使用自有 Key（非公共额度）',
+  quotaRefused: 'OpenCode 客户端内免费档被拒绝（{time} 前）',
   bridgePort: '目录桥端口',
   dataSource: '数据源',
   autoSync: '自动同步',
@@ -102,35 +97,33 @@ const zh = {
   includeDeprecated: '显示已下架的免费模型',
   includeDeprecatedHint: '默认不显示任何已下架的模型：models.dev 标记弃用的，以及 Zen 已下架的。勾选后两者都会列出，但 Zen 已下架的仍标记为不可用，勾了也无法调用。',
   retry: '失败重试',
-  retryAttempts: '最多尝试几次',
   retryBackoff: '初始退避（毫秒）',
-  retryHint: '遇到 429 限流或 5xx（含 Zen 网关 502 上游连接超时）时自动退避重试。默认 10 次；退避逐次翻倍、单次最长 8 秒，十次合计约 1 分钟。全部失败后错误信息会写明已重试几次。',
-  quotaPolicy: '使用规则',
-  policyPublicOnly: '仅使用公共额度',
-  policyPublicOnlyHint: '默认规则。任何情况下都不动用 Key，即使配置了也不用。',
-  policyPreferPublic: '优先使用公共额度',
-  policyPreferPublicHint: '先用公共额度；只有「公共免费额度已用尽」或「拒绝了匿名免费档调用」时才回退到 Key。',
-  policyPreferKey: '优先使用私有额度',
-  policyPreferKeyHint: '先用 Key；Key 无效、被拒或额度用尽时才回退到公共额度。',
-  policyLocked: '需先通过 Key 校验才能选用',
-  verifyKey: '校验 Key',
-  verifying: '校验中…',
-  keyVerified: 'Key 校验通过（{time}）',
-  keyRejected: 'Key 校验未通过：{reason}',
-  keyUnchecked: '尚未校验 Key',
-  keyPending: '已填写 Key，正在同步到宿主…',
-  apiKeys: '私有额度 Key',
-  apiKeysHint: '逐条粘贴 Key 即可，不需要配置环境变量。保存后插件会自动按行号写入进程环境变量（见每行左侧名字），重启后依然有效。',
-  keyAdd: '添加 Key',
-  keyRemove: '删除这条 Key',
-  zenKey: '在 opencode.ai/zen 领取 Key',
+  retryHint: '只走本机 OpenCode 客户端（bridge）。客户端报错时最多再试 3 次，退避逐次翻倍、单次最长 8 秒；遇到 429 限流或上下文超窗不重试，直接报错（重试只会把冷却窗口推得更远）。全部失败后错误信息会写明已重试几次。',
   zenBaseURL: 'Zen 接口地址',
   catalogURL: '模型目录地址',
+  // ---- OpenCode 账户登录 ----
+  accountTitle: 'OpenCode 账户登录',
+  accountHint: '登录 OpenCode 账户可多拿免费额度（客户端内免费档）。请求由本机 OpenCode 客户端代发，客户端的登录态决定能用到哪一档免费额度；凭据只存在本机插件缓存里，不依赖手动配置 Key。',
+  accountEnable: '启用登录（多拿免费额度）',
+  accountEnableHint: '关闭后不再启用账户登录入口；已经存下的 token 保留但停用。',
+  loginHint: '出网固定走本机 OpenCode 客户端（bridge）：直连公共额度经实测一律 429，只有真实客户端能放行。登录 OpenCode 账户可多拿客户端内免费额度。',
+  accountLogin: '登录 OpenCode 账户',
+  accountLoggingIn: '等待浏览器登录…',
+  accountUserCode: '请在浏览器里输入这个代码',
+  accountOpen: '打开登录页面',
+  accountPolling: '正在等你完成登录…',
+  accountLoggedIn: '已登录 OpenCode 账户（到期 {time}）',
+  accountLogout: '登出账户',
+  accountError: '账户登录出错：{error}',
+  accountNone: '尚未登录 OpenCode 账户',
+  accountDisabledHint: '账户登录已关闭：启用上面的开关后才能登录。',
+  accountDisabledLoggedIn: '账户档已关闭，当前不使用这个账户的额度',
+  accountPending: '登录流程进行中',
 }
 
 const en = {
   title: 'OpenCode free models',
-  intro: 'Free models discovered live from OpenCode Zen and models.dev. Enable them one by one, or write the llm-pi-ai provider in one click. No key; authentication is a fixed Bearer public.',
+  intro: 'Free models discovered live from OpenCode Zen and models.dev. Enable them one by one, or write the llm-pi-ai provider in one click. Every turn is sent by the local OpenCode client (bridge); no key is configured in this plugin.',
   enabled: 'Enable plugin',
   enabledHint: 'Off removes every free model from the picker and rejects messages already using one.',
   search: 'Search models',
@@ -167,15 +160,10 @@ const en = {
   vision: 'vision',
   fromZen: 'from Zen',
   fromManual: 'manual',
-  quotaOk: 'Public free quota is healthy',
-  quotaThrottled: 'Public free quota throttled; expected to recover at {time}',
+  quotaOk: 'OpenCode client free tier is healthy',
+  quotaThrottled: 'OpenCode client free tier throttled; expected to recover at {time}',
   quotaHits: 'Throttled {count} times in total',
-  quotaRefused: 'Public free lane was refused ({time} ago); using your key meanwhile',
-  quotaClosed: 'Public free quota unavailable right now; requests go straight to your key',
-  keyConfigured: '{count} key(s) configured · current rule: {policy}',
-  noKeyOnly: 'No key configured: only the public free quota is available',
-  laneRule: 'Quota rule: every call tries the public free quota first, and falls back to a configured key only on "public quota exhausted" or "anonymous free tier refused". It returns to the public quota once the window passes.',
-  keyed: 'Using your own key (not the public quota)',
+  quotaRefused: 'OpenCode client free lane was refused ({time} ago)',
   bridgePort: 'Catalog bridge port',
   dataSource: 'Data source',
   autoSync: 'Auto sync',
@@ -184,30 +172,28 @@ const en = {
   includeDeprecated: 'Show withdrawn free models',
   includeDeprecatedHint: 'Off by default: neither the models models.dev has retired nor the ones Zen has taken down are listed. Turning it on lists both, but one Zen withdrew stays marked unavailable and cannot be called.',
   retry: 'Failure retries',
-  retryAttempts: 'Attempts',
   retryBackoff: 'Initial backoff (ms)',
-  retryHint: 'Retried with backoff on 429 throttling and any 5xx (including Zen gateway 502 upstream connect timeouts). Default 10; the step doubles each time and is capped at 8s, so ten attempts wait about a minute in total. The final error states how many were spent.',
-  quotaPolicy: 'Usage rule',
-  policyPublicOnly: 'Public quota only',
-  policyPublicOnlyHint: 'The default. Never spends a key, even when one is configured.',
-  policyPreferPublic: 'Prefer the public quota',
-  policyPreferPublicHint: 'Public quota first; falls back to a key only on "public quota exhausted" or "anonymous free tier refused".',
-  policyPreferKey: 'Prefer your own quota',
-  policyPreferKeyHint: 'Key first; falls back to the public quota when the key is rejected, invalid, or out of quota.',
-  policyLocked: 'Requires a verified key',
-  verifyKey: 'Verify key',
-  verifying: 'Verifying…',
-  keyVerified: 'Key verified ({time})',
-  keyRejected: 'Key check failed: {reason}',
-  keyUnchecked: 'Key not verified yet',
-  keyPending: 'Key entered; syncing to the Host…',
-  apiKeys: 'Private-quota keys',
-  apiKeysHint: 'Paste each key on its own row — no environment variables to configure. The plugin exports them under the names shown at the left of each row, and they survive a restart.',
-  keyAdd: 'Add key',
-  keyRemove: 'Remove this key',
-  zenKey: 'Get a key at opencode.ai/zen',
+  retryHint: 'Only the local OpenCode client (bridge) sends turns. A client error is retried up to 3 times with doubling backoff capped at 8s per step; a 429 or a context overflow is never retried (retries only push the cooldown further out). The final error states how many attempts were spent.',
   zenBaseURL: 'Zen endpoint',
   catalogURL: 'Model catalog endpoint',
+  // ---- OpenCode account sign-in ----
+  accountTitle: 'OpenCode account sign-in',
+  accountHint: 'Signing in to your OpenCode account gets you more free quota (the client-internal free tier). The local OpenCode client sends every turn, and its sign-in state decides which free tier is available. Credentials live only in the local plugin cache; no manual keys needed.',
+  accountEnable: 'Enable sign-in (more free quota)',
+  accountEnableHint: 'Off disables the sign-in entry; a stored token is kept but not used.',
+  loginHint: 'Every turn goes through the local OpenCode client (bridge): direct requests to the public quota were measured to return 429 every time, only the real client is allowed. Signing in gives you more client-internal free quota.',
+  accountLogin: 'Sign in to OpenCode account',
+  accountLoggingIn: 'Waiting for browser sign-in…',
+  accountUserCode: 'Enter this code in the browser',
+  accountOpen: 'Open sign-in page',
+  accountPolling: 'Waiting for you to finish signing in…',
+  accountLoggedIn: 'Signed in to OpenCode (expires {time})',
+  accountLogout: 'Sign out',
+  accountError: 'Account sign-in error: {error}',
+  accountNone: 'Not signed in to an OpenCode account',
+  accountDisabledHint: 'Account sign-in is off: turn on the switch above to sign in.',
+  accountDisabledLoggedIn: 'account tier is off, so this account quota is not used',
+  accountPending: 'Sign-in in progress',
 }
 
 const ROW = { display: 'flex', alignItems: 'center', gap: 8, padding: '6px 0' }
@@ -311,20 +297,17 @@ async function readBridgeCatalog(firstPort, span, signal) {
 }
 
 /**
- * Ask the Host to prove a configured key works.
- *
- * Costs one upstream request, so it is never implicit: the operator presses a
- * button. `force` re-checks even when a previous verdict is still valid.
+ * Start an OpenCode account device authorization. Returns the `user_code` and
+ * the absolute `verification_uri_complete` the operator opens in a browser.
  * @param firstPort - configured bridge port.
  * @param span - how many ports to walk.
- * @param force - re-check instead of reusing the cached verdict.
- * @returns the Host's verdict.
+ * @returns the Host's `startDeviceAuthorization()` result.
  */
-async function requestKeyCheck(firstPort, span, force) {
+async function requestOcLogin(firstPort, span) {
   for (let offset = 0; offset < span; offset++) {
     try {
       const response = await fetch(
-        `http://127.0.0.1:${firstPort + offset}/verify-key${force ? '?force=1' : ''}`,
+        `http://127.0.0.1:${firstPort + offset}/oc-login`,
         { credentials: 'omit', cache: 'no-store' },
       )
       if (!response.ok) continue
@@ -338,8 +321,76 @@ async function requestKeyCheck(firstPort, span, force) {
 }
 
 /**
- * The Settings page.
- *
+ * Poll the account device token once. The page owns the polling cadence so the
+ * Host only answers one question at a time.
+ * @param firstPort - configured bridge port.
+ * @param span - how many ports to walk.
+ * @returns the Host's `pollDeviceToken()` result.
+ */
+async function requestOcPoll(firstPort, span) {
+  for (let offset = 0; offset < span; offset++) {
+    try {
+      const response = await fetch(
+        `http://127.0.0.1:${firstPort + offset}/oc-login-poll`,
+        { credentials: 'omit', cache: 'no-store' },
+      )
+      if (!response.ok) continue
+      if (response.headers.get(BRIDGE_MARKER) !== '1') continue
+      return await response.json()
+    } catch {
+      // Not our port; keep walking.
+    }
+  }
+  throw new Error('no catalog bridge answered')
+}
+
+/**
+ * Read the current account status (logged in, expiry, refresh capability).
+ * @param firstPort - configured bridge port.
+ * @param span - how many ports to walk.
+ * @returns the Host's `getAccountStatus()` result.
+ */
+async function requestOcStatus(firstPort, span) {
+  for (let offset = 0; offset < span; offset++) {
+    try {
+      const response = await fetch(
+        `http://127.0.0.1:${firstPort + offset}/oc-account-status`,
+        { credentials: 'omit', cache: 'no-store' },
+      )
+      if (!response.ok) continue
+      if (response.headers.get(BRIDGE_MARKER) !== '1') continue
+      return await response.json()
+    } catch {
+      // Not our port; keep walking.
+    }
+  }
+  throw new Error('no catalog bridge answered')
+}
+
+/**
+ * Clear the stored account token and pending device state.
+ * @param firstPort - configured bridge port.
+ * @param span - how many ports to walk.
+ * @returns the Host's `{ ok }` result.
+ */
+async function requestOcLogout(firstPort, span) {
+  for (let offset = 0; offset < span; offset++) {
+    try {
+      const response = await fetch(
+        `http://127.0.0.1:${firstPort + offset}/oc-logout`,
+        { credentials: 'omit', cache: 'no-store' },
+      )
+      if (!response.ok) continue
+      if (response.headers.get(BRIDGE_MARKER) !== '1') continue
+      return await response.json()
+    } catch {
+      // Not our port; keep walking.
+    }
+  }
+  throw new Error('no catalog bridge answered')
+}
+
+/**
  * @param props - `close` from the settings shell, plus the `t` translator and
  * the bound form this registration injects.
  * @returns the page element.
@@ -353,15 +404,13 @@ function OpenCodeFreeSettings(props) {
   const [notice, setNotice] = useState(null)
   const [query, setQuery] = useState('')
   const [draft, setDraft] = useState({ id: '', name: '', contextWindow: '200000' })
-  // The key verdict is local to the page: the Host is the authority, but pressing
-  // "verify" must give immediate feedback, so the answer is echoed here until
-  // the next catalog read overwrites it with the same fact.
-  const [keyCheck, setKeyCheck] = useState(null)
-  const [verifying, setVerifying] = useState(false)
-  // The keys being edited. Held locally so typing does not write the profile on
-  // every keystroke; the whole list is committed on each change instead, which
-  // is also what makes the Host re-export it immediately.
-  const [keyDraft, setKeyDraft] = useState(null)
+  // OpenCode 账户额度（真·OAuth 设备流直连）的本地状态。Host 是权威，页面把它的
+  // 回答回显出来，并自己掌握轮询节奏——这样一次登录流程不会因为页面重渲染而断。
+  const [accountStatus, setAccountStatus] = useState(null) // { loggedIn, expiresAt, hasRefresh, pending }
+  const [accountLogin, setAccountLogin] = useState(null) // { user_code, verification_uri_complete, interval, expires_in }
+  const [accountPolling, setAccountPolling] = useState(false)
+  const [accountError, setAccountError] = useState('')
+  const accountTimerRef = useRef(null)
 
   // Checkbox ticks shown ahead of the Host, keyed by field. A write is a
   // round trip through the Host and back, and a tick that only appears when it
@@ -384,6 +433,9 @@ function OpenCodeFreeSettings(props) {
   const disabledModels = Array.isArray(value.disabledModels) ? value.disabledModels : []
   const manualModels = Array.isArray(value.manualModels) ? value.manualModels : []
   const bridgePort = Number.isInteger(value.bridgePort) ? value.bridgePort : DEFAULT_BRIDGE_PORT
+  // 账户登录开关。关掉 = 登录入口禁用（UI 置灰 + Host 拒绝 /oc-login），
+  // 不是「静默忽略」：用户关掉之后不该还能点出一次登录流程。
+  const accountEnabled = value.ocAccountEnabled !== false
 
   /**
    * Queue one field write.
@@ -448,53 +500,98 @@ function OpenCodeFreeSettings(props) {
   }, [bridgePort, set])
 
   /**
-   * Prove a configured key works, so the key-gated rules may be chosen.
-   *
-   * The Host is the authority and keeps the verdict across restarts; this only
-   * mirrors it so the operator sees the result of the press they just made. A
-   * failure is shown as a message rather than silently leaving the old one,
-   * because the whole point is knowing which way it went.
+   * Re-read the account status from the Host. The Host is the authority; the
+   * page only mirrors it so the operator sees the login state without a full
+   * catalog round trip.
    */
-  const verifyKey = useCallback(async () => {
-    setVerifying(true)
+  const refreshAccountStatus = useCallback(async () => {
     try {
-      const result = await requestKeyCheck(bridgePort, BRIDGE_PORT_SPAN, true)
-      setKeyCheck(result)
-      void load(false)
-      return result
-    } catch (error) {
-      setKeyCheck({ ok: false, status: 0, reason: error?.message ?? String(error) })
-      return null
-    } finally {
-      setVerifying(false)
+      const status = await requestOcStatus(bridgePort, BRIDGE_PORT_SPAN)
+      setAccountStatus(status)
+    } catch {
+      // A missed read must not wipe the previous state, only hold the last one.
     }
-  }, [bridgePort, load])
+  }, [bridgePort])
+
+  /** Stop a pending poll loop, if any. */
+  const stopAccountPolling = useCallback(() => {
+    if (accountTimerRef.current !== null) {
+      clearTimeout(accountTimerRef.current)
+      accountTimerRef.current = null
+    }
+    setAccountPolling(false)
+  }, [])
 
   /**
-   * The keys as edited, falling back to what the Host holds.
-   *
-   * `keyDraft` is null until the operator touches a row, so the page shows the
-   * persisted list rather than an empty one on first paint.
+   * Drive the device login: open the flow on the Host, then poll until the
+   * operator finishes in the browser or the device code expires.
+   * @param intervalSec - poll cadence from the device-code response.
    */
-  const keyValues = keyDraft !== null
-    ? keyDraft
-    : (Array.isArray(value.apiKeys) ? value.apiKeys.map((v) => String(v ?? '')) : [])
+  const pollAccountLoop = useCallback(async (intervalSec) => {
+    setAccountPolling(true)
+    const tick = async () => {
+      accountTimerRef.current = null
+      try {
+        const result = await requestOcPoll(bridgePort, BRIDGE_PORT_SPAN)
+        if (result.status === 'done') {
+          setAccountPolling(false)
+          setAccountLogin(null)
+          setAccountError('')
+          await refreshAccountStatus()
+        } else if (result.status === 'expired') {
+          setAccountPolling(false)
+          setAccountLogin(null)
+          setAccountError(t('accountPending'))
+        } else if (result.status === 'error') {
+          setAccountPolling(false)
+          setAccountLogin(null)
+          setAccountError(String(result.error_description || result.error || 'poll error'))
+        } else {
+          // authorization_pending / slow_down → schedule the next poll.
+          accountTimerRef.current = setTimeout(tick, Math.max(1, intervalSec) * 1000)
+        }
+      } catch (error) {
+        setAccountPolling(false)
+        setAccountLogin(null)
+        setAccountError(error?.message ?? String(error))
+      }
+    }
+    tick()
+  }, [bridgePort, refreshAccountStatus, t])
 
-  /**
-   * Commit the whole key list.
-   *
-   * One write per edit, not per keystroke, so the profile is not rewritten
-   * constantly — and the Host re-exports the variables on the write it does
-   * get, which is what makes a newly typed key immediately verifiable.
-   * @param next - the new list.
-   */
-  const commitKeys = useCallback(async (next) => {
-    setKeyDraft(next)
-    return set('apiKeys', next)
-  }, [set])
-  const replaceKey = (index, next) => commitKeys(keyValues.map((v, i) => (i === index ? next : v)))
-  const removeKey = (index) => commitKeys(keyValues.filter((_, i) => i !== index))
-  const addKey = () => commitKeys([...keyValues, ''])
+  /** Begin a device login: fetch the code, then start polling. */
+  const startAccountLogin = useCallback(async () => {
+    // 开关关着就不该走到这里（按钮已置灰），但状态是异步回读的，留一道闸。
+    if (!accountEnabled) {
+      setAccountError(t('accountDisabledHint'))
+      return
+    }
+    setAccountError('')
+    try {
+      const info = await requestOcLogin(bridgePort, BRIDGE_PORT_SPAN)
+      if (info && info.error) {
+        setAccountError(String(info.error_description || info.error))
+        return
+      }
+      setAccountLogin(info)
+      await pollAccountLoop(Number(info.interval) || 5)
+    } catch (error) {
+      setAccountError(error?.message ?? String(error))
+    }
+  }, [bridgePort, pollAccountLoop, accountEnabled, t])
+
+  /** Sign out: clear both the token and any in-flight poll. */
+  const logoutAccount = useCallback(async () => {
+    stopAccountPolling()
+    setAccountLogin(null)
+    setAccountError('')
+    try {
+      await requestOcLogout(bridgePort, BRIDGE_PORT_SPAN)
+    } catch {
+      // Even if the Host round trip fails, reflect the local intent.
+    }
+    await refreshAccountStatus()
+  }, [bridgePort, stopAccountPolling, refreshAccountStatus])
 
   // Read on mount, then keep reading: the Host rediscovers on its own schedule
   // and the page must show that without the operator pressing anything. A
@@ -505,6 +602,30 @@ function OpenCodeFreeSettings(props) {
     const timer = setInterval(() => { void load(false) }, CATALOG_POLL_MS)
     return () => { clearInterval(timer) }
   }, [load])
+
+  // Read account status on mount, then keep it fresh so the expiry line ticks
+  // down without the operator pressing anything. A background refresh by the
+  // Host shows up here on the next tick too.
+  useEffect(() => {
+    void refreshAccountStatus()
+    const timer = setInterval(() => { void refreshAccountStatus() }, 30_000)
+    return () => { clearInterval(timer) }
+  }, [refreshAccountStatus])
+
+  // Clear any pending poll on unmount so a backgrounded tab cannot keep ringing
+  // the token endpoint forever.
+  useEffect(() => () => {
+    if (accountTimerRef.current !== null) clearTimeout(accountTimerRef.current)
+  }, [])
+
+  // 登录开关关掉的瞬间就把轮询停掉：否则一个已经开始的设备流会继续每几秒
+  // 打一次 /oc-login-poll，Host 那边会一直回 oc_account_disabled，页面上还会
+  // 停在「等你完成登录」——开关明明关了，流程却在后台空转。
+  useEffect(() => {
+    if (accountEnabled) return
+    stopAccountPolling()
+    setAccountLogin(null)
+  }, [accountEnabled, stopAccountPolling])
 
   const rows = useMemo(() => {
     const listed = Array.isArray(remote?.catalog) ? remote.catalog : []
@@ -634,30 +755,7 @@ function OpenCodeFreeSettings(props) {
   }, [forms, t])
 
   const quota = remote?.quota
-  // How many keys the Host resolved — not whether one is in use. Which lane a
-  // request spends is the operator's `quotaPolicy`, so "has a key" and "is
-  // paying for this request" are separate facts and the page shows them apart.
-  const keyCount = Number(remote?.keyCount ?? 0)
-  // Whether the Host has a key it has proven works. This, not the mere presence
-  // of a key, is what unlocks the two keyed rules.
-  const keyVerified = remote?.keyVerified === true
-  const policyValue = QUOTA_POLICIES.includes(value.quotaPolicy) ? value.quotaPolicy : 'publicOnly'
-  // Keys with something in them, counted locally. The Host's `keyCount` can lag
-  // by a settings round trip; this is what the operator just typed, and it is
-  // what the verify button is gated on. Declared before its first use — a
-  // `const` referenced earlier in the same scope throws on render, which is how
-  // this page went blank for a whole release.
-  const filledKeyCount = keyValues.filter((v) => v.trim() !== '').length
-  // The verdict to show: this page's own answer if the operator just pressed
-  // the button, otherwise whatever the Host last persisted.
-  const verdict = keyCheck !== null ? keyCheck : remote?.keyCheck
-  const keyCheckLine = filledKeyCount === 0
-    ? t('noKeyOnly')
-    : (verdict === null || verdict === undefined
-      ? t('keyUnchecked')
-      : (verdict.ok === true
-        ? t('keyVerified', { time: Number(verdict.checkedAt ?? 0) > 0 ? new Date(verdict.checkedAt).toLocaleTimeString() : '—' })
-        : t('keyRejected', { reason: String(verdict.reason ?? '') })))
+  // 请求路由只有 bridge 一条，私有 Key 不参与；这里不再派生任何路由策略。
   const syncedAt = Number(remote?.syncedAt ?? 0)
   const written = useMemo(
     () => (rows.length === 0 ? null : buildProviderEntry(buildModelSet(remote?.catalog ?? [], manualModels, disabledModels, {}))),
@@ -679,9 +777,8 @@ function OpenCodeFreeSettings(props) {
     h('p', { style: NOTE }, t('enabledHint')),
 
     // ---- quota ----
-    // Two facts, not one. Whether the free lane is usable right now, and
-    // whether a key is waiting behind it — because the lane leads and the key
-    // follows, "key configured" no longer means "key in use".
+    // 只讲一件事实：本机 OpenCode 客户端的免费档现在是否还能用。429 时宿主
+    // 把网关给的重开时间记进来，这里才有「什么时候回来」可说。
     quota === undefined ? null : h('p', {
       style: {
         ...NOTE,
@@ -694,17 +791,61 @@ function OpenCodeFreeSettings(props) {
       : (quota.throttled
         ? `${t('quotaThrottled', { time: new Date(quota.resetAt).toLocaleTimeString() })} · ${t('quotaHits', { count: quota.hits })}`
         : `${t('quotaOk')}${quota.hits > 0 ? ` · ${t('quotaHits', { count: quota.hits })}` : ''}`)),
-    quota?.closed === true && keyVerified && policyValue !== 'publicOnly'
-      ? h('p', { style: { ...NOTE, color: '#ff9f6b' } }, t('quotaClosed'))
-      : null,
-    // Only the count here. Whether those keys are usable, and whether the
-    // current rule would ever spend them, are shown next to the rule itself —
-    // one fact per line, so nothing has to be inferred.
-    filledKeyCount > 0
-      ? h('p', { style: NOTE }, t('keyConfigured', {
-        count: filledKeyCount,
-        policy: t(`policy${policyValue[0].toUpperCase()}${policyValue.slice(1)}`),
-      }))
+
+    // ---- OpenCode 账户登录 ----
+    // 客户端自身的登录态决定可用免费档。UI 三态：已登录（显示到期时间 + 登出）
+    // → 登录中（显示代码 + 打开链接 + 轮询提示）→ 未登录（显示登录按钮）。
+    h('label', { style: { ...LABEL, marginTop: 16 } }, t('accountTitle')),
+    h('p', { style: { ...NOTE, margin: '0 0 6px' } }, t('accountHint')),
+    h('label', { style: { ...ROW, marginTop: 6 } },
+      h('input', {
+        type: 'checkbox',
+        checked: tickOf('ocAccountEnabled', value.ocAccountEnabled !== false),
+        disabled: !writable,
+        onChange: (event) => { void toggleBoolean('ocAccountEnabled', event.target.checked) },
+      }),
+      h('span', { style: { fontSize: 13 } }, t('accountEnable'))),
+    h('p', { style: NOTE }, t('accountEnableHint')),
+
+    accountStatus && accountStatus.loggedIn
+      ? h('p', {
+          style: { ...NOTE, opacity: 1, color: accountEnabled ? '#34c77b' : '#c9a227', margin: '6px 0' },
+        },
+        `${t('accountLoggedIn', { time: Number(accountStatus.expiresAt) > 0 ? new Date(accountStatus.expiresAt).toLocaleTimeString() : '—' })} `,
+        // 已登录但开关关着：token 还在、但不算数。必须说出来，否则用户以为它正在生效。
+        accountEnabled ? null : `· ${t('accountDisabledLoggedIn')} `,
+        h('button', {
+          type: 'button',
+          style: { ...BUTTON, marginLeft: 10, padding: '3px 10px' },
+          disabled: !writable,
+          onClick: () => { void logoutAccount() },
+        }, t('accountLogout')))
+      : (accountLogin
+        ? h('div', { style: { margin: '6px 0' } },
+            h('p', { style: { ...NOTE, opacity: 1 } }, t('accountUserCode')),
+            h('code', { style: { fontSize: 16, fontWeight: 600, letterSpacing: 2, display: 'inline-block', padding: '2px 8px', borderRadius: 6, border: '1px solid #555a' } }, accountLogin.user_code ?? ''),
+            h('a', {
+              href: accountLogin.verification_uri_complete ?? 'https://opencode.ai/console/device',
+              target: '_blank',
+              rel: 'noreferrer noopener',
+              style: { ...BUTTON, display: 'inline-block', marginLeft: 10, textDecoration: 'none' },
+            }, t('accountOpen')),
+            h('p', { style: { ...NOTE, color: accountPolling ? '#ffd479' : undefined } },
+              accountPolling ? t('accountPolling') : t('accountPending')))
+        : h('div', { style: { ...ROW, marginTop: 6 } },
+            h('button', {
+              type: 'button',
+              style: BUTTON,
+              // 关闭时入口是「不可用」，不是「点了报错」。
+              disabled: !writable || accountPolling || !accountEnabled,
+              title: accountEnabled ? undefined : t('accountDisabledHint'),
+              onClick: () => { void startAccountLogin() },
+            }, accountPolling ? t('accountLoggingIn') : t('accountLogin')),
+            h('span', { style: { fontSize: 11.5, opacity: 0.8 } },
+              accountEnabled ? t('accountNone') : t('accountDisabledHint')))),
+
+    accountError !== ''
+      ? h('p', { style: { ...NOTE, color: '#ff6b6b' } }, t('accountError', { error: accountError }))
       : null,
 
     // ---- catalog ----
@@ -852,20 +993,7 @@ function OpenCodeFreeSettings(props) {
 
     h('label', { style: LABEL }, t('retry')),
     h('div', { style: { ...ROW, marginTop: 4, alignItems: 'center' } },
-      h('span', { style: { fontSize: 12.5, opacity: 0.8 } }, t('retryAttempts')),
-      h('input', {
-        style: { ...INPUT, width: 90 },
-        type: 'number',
-        min: 1,
-        max: 20,
-        value: String(clampAttempts(value.maxRequestAttempts)),
-        disabled: !writable,
-        onChange: (event) => {
-          const next = Number(event.target.value)
-          if (Number.isFinite(next) && next >= 1) set('maxRequestAttempts', Math.min(20, Math.floor(next)))
-        },
-      }),
-      h('span', { style: { fontSize: 12.5, opacity: 0.8, marginLeft: 16 } }, t('retryBackoff')),
+      h('span', { style: { fontSize: 12.5, opacity: 0.8 } }, t('retryBackoff')),
       h('input', {
         style: { ...INPUT, width: 110 },
         type: 'number',
@@ -882,94 +1010,9 @@ function OpenCodeFreeSettings(props) {
     ),
     h('p', { style: NOTE }, t('retryHint')),
 
-    h('label', { style: LABEL }, t('apiKeys')),
-    h('p', { style: { ...NOTE, margin: '0 0 6px' } },
-      h('a', {
-        href: 'https://opencode.ai/zen',
-        target: '_blank',
-        rel: 'noreferrer noopener',
-        style: { color: 'inherit', textDecoration: 'underline' },
-      }, t('zenKey'))),
-
-    // ---- key editor ----
-    // One row per key, value only. The environment variable name is derived
-    // from the row's position and shown read-only, because "set an environment
-    // variable" is a step most operators should never have to take — and one
-    // they cannot complete without restarting the process, which is what made
-    // a freshly added key read as "no key" and left Verify dead.
-    ...keyValues.map((keyValue, index) => h('div', { key: `key-${index}`, style: { ...ROW, marginTop: 4 } },
-      h('span', { style: { fontSize: 10.5, opacity: 0.6, width: 150, flexShrink: 0 } }, apiKeyNameFor(index)),
-      h('input', {
-        style: { ...INPUT, flex: 1 },
-        type: 'text',
-        autoComplete: 'off',
-        spellCheck: false,
-        placeholder: 'sk-…',
-        value: keyValue,
-        disabled: !writable,
-        onChange: (event) => { void replaceKey(index, event.target.value) },
-      }),
-      h('button', {
-        type: 'button',
-        style: { ...BUTTON, padding: '4px 8px' },
-        disabled: !writable,
-        title: t('keyRemove'),
-        onClick: () => { void removeKey(index) },
-      }, '×'))),
-    h('div', { style: { ...ROW, marginTop: 6 } },
-      h('button', {
-        type: 'button',
-        style: BUTTON,
-        disabled: !writable,
-        onClick: () => { void addKey() },
-      }, t('keyAdd'))),
-    h('p', { style: NOTE }, t('apiKeysHint')),
-
-    // ---- usage rule ----
-    // Three options, not a boolean: "I have a key" and "use my key" are
-    // different decisions, and the default has to be the one that keeps this
-    // plugin free. The two keyed rules stay disabled until the Host says the key
-    // was accepted — otherwise a typo would silently bill a lane that then fails
-    // for every request, and it would read as an outage rather than a typo.
-    h('label', { style: { ...LABEL, marginTop: 16 } }, t('quotaPolicy')),
-    ...QUOTA_POLICIES.map((policy) => {
-      const gated = KEY_GATED_POLICIES.includes(policy) && keyVerified !== true
-      return h('label', {
-        key: policy,
-        style: { ...ROW, opacity: gated ? 0.5 : 1, cursor: gated ? 'not-allowed' : 'pointer' },
-      },
-        h('input', {
-          type: 'radio',
-          name: 'opencode-free-quota-policy',
-          value: policy,
-          checked: policyValue === policy,
-          disabled: !writable || gated,
-          onChange: () => { void set('quotaPolicy', policy) },
-        }),
-        h('span', { style: { fontSize: 13 } }, t(`policy${policy[0].toUpperCase()}${policy.slice(1)}`)),
-        gated ? h('span', { style: { fontSize: 10.5, opacity: 0.7 } }, `· ${t('policyLocked')}`) : null)
-    }),
-    h('p', { style: NOTE }, t(`policy${String(policyValue)[0].toUpperCase()}${String(policyValue).slice(1)}Hint`)),
-
-    // ---- key verification ----
-    // Enabled by what the operator typed, not by what the Host has parsed yet:
-    // gating it on `keyCount` made the button dead for exactly the people who
-    // had just added a key, which reads as "nothing happens when I click".
-    h('div', { style: { ...ROW, marginTop: 8 } },
-      h('button', {
-        type: 'button',
-        style: BUTTON,
-        disabled: !writable || verifying || filledKeyCount === 0,
-        onClick: () => { void verifyKey() },
-      }, verifying ? t('verifying') : t('verifyKey')),
-      h('span', { style: { fontSize: 11.5, opacity: 0.85 } }, keyCheckLine)),
-    // The Host only learns about a key on the next settings change, so there is
-    // a window where the page has one and the Host does not. Saying so is the
-    // difference between "waiting" and "broken".
-    filledKeyCount > 0 && keyCount === 0
-      ? h('p', { style: { ...NOTE, color: '#ff9f6b' } }, t('keyPending'))
-      : null,
-    h('p', { style: NOTE }, t('laneRule')),
+    // ---- 登录提示 ----
+    // 路由只有一条：本机 OpenCode 客户端（bridge）。直连公共额度已实测一律 429。
+    h('label', { style: { ...LABEL, marginTop: 16 } }, t('loginHint')),
 
     h('label', { style: LABEL }, t('bridgePort')),
     h('input', {
@@ -1008,23 +1051,9 @@ const name = 'dsh-connect-opencode-free-client'
 const inject = ['slots', 'locale']
 
 /**
- * The retry count to show in the input.
- *
- * The schema default is the operator's real behaviour when they have never
- * touched the field, so an absent value has to read as that default rather than
- * as an empty box they might "fix" into a lower number.
- * @param value - the stored `maxRequestAttempts`, possibly undefined.
- * @returns a number safe to put in the input.
- */
-function clampAttempts(value) {
-  return clampInt(value, 1, 20, 10)
-}
-
-/**
  * The initial backoff to show in the input.
  *
- * Same reasoning as {@link clampAttempts}: a profile written before this field
- * existed reads as the default, not as zero.
+ * A profile written before this field existed reads as the default, not as zero.
  * @param value - the stored `retryBackoffMs`, possibly undefined.
  * @returns a number safe to put in the input.
  */
